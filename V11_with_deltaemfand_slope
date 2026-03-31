@@ -1,0 +1,1909 @@
+"""
+Smart Probe — H₂ Real-Time Detector  v11
+=========================================
+ROOT CAUSE FIXED + DELTA-EMF DUAL FEATURE
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHAT'S FIXED vs v10
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. SLOPE MEASUREMENT FIX (main bug you reported)
+   OLD behaviour: max(dvdt) over first 20 samples counted from the moment
+   the 5-pt rolling window first crosses the onset threshold.  At that
+   moment the 5-pt buffer still contains old baseline diffs → the first
+   dvdt reading is UNDER-estimated → triggers onset, then the rolling
+   mean keeps rising for ~5 more samples as the buffer fills → ppm
+   appears to climb for the first 1.5 s.
+
+   NEW behaviour (MEAN_20 algorithm):
+     a) Onset detected (fast or slow path — unchanged).
+     b) Wait TRIG_WIN (5) samples so the 5-pt diff buffer is 100% filled
+        with transition diffs.  During this delay we do NOT accumulate.
+     c) Collect EXACTLY 20 consecutive dvdt values.
+     d) slope = MEAN of those 20 values   (not max).
+        Mean is more stable across noise.
+     e) delta_emf = V[end_of_window] - V[onset]
+        (total EMF rise over the measurement window).
+   Both slope and delta_emf are frozen at sample 20.  The display_ppm
+   is computed once at that moment and NEVER updated until the next event.
+
+2. MINIMUM DIFF GATE
+   Your rule: "always require minimum 1 mV interval difference to count,
+   except 0→100 ppm where diffs can be 0.5–0.7 mV".
+   Implementation: each sample in the 20-pt window is only included
+   in the mean if  |diff| >= MIN_DIFF_MV  (default 0.5 mV).  This
+   prevents near-flat noise from polluting the slope estimate.
+   For 0→100 ppm the diffs are 0.5–0.8 mV so they still pass the 0.5 gate.
+   For all higher concentrations the diffs are >> 1 mV so they trivially pass.
+
+3. DELTA-EMF CALIBRATION + DUAL-FEATURE DETECTION
+   Calibration now stores (slope, delta_emf) per (baseline, target) pair.
+   During detection the hybrid engine uses BOTH features:
+     score = w_slope * |slope_meas - slope_cal|/slope_cal
+           + w_emf   * |delta_meas - delta_cal |/delta_cal
+   The (baseline, target) pair with the lowest combined score wins.
+   Weights: w_slope=0.6, w_emf=0.4   (slope has more weight).
+   This makes 0→100 ppm detection much more reliable because even if
+   the slope estimate is noisy the delta_emf ≈ 4–6 mV is very distinct
+   from 0→1000 ppm (delta_emf ≈ 50 mV).
+
+4. CALIBRATION WIZARD: displays BOTH slope AND delta_emf after capture
+   and stores both in the knowledge base.
+
+5. CURVES TAB: shows a 2D scatter (slope vs delta_emf per target) in
+   addition to the existing 1D slope-vs-ppm plots.
+
+Usage:  python h2_detector_v11.py  [optional_log.log]
+Deps:   pip install numpy matplotlib scipy
+"""
+
+import os, re, sys, csv, time, math, threading, collections, copy, json
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import numpy as np
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.figure import Figure
+from scipy.optimize import curve_fit
+
+# ── colour palette ────────────────────────────────────────────────────────────
+BG      = "#0d1117";  PANEL   = "#161b22";  BORDER  = "#30363d"
+TEXT    = "#e6edf3";  SUB     = "#8b949e";  ACCENT  = "#58a6ff"
+GREEN   = "#3fb950";  RED     = "#f85149";  YELLOW  = "#d29922"
+PURPLE  = "#bc8cff";  CYAN    = "#39d353";  ORANGE  = "#db6d28"
+TEAL    = "#00e5a0";  SURFACE = "#111418";  SURFACE2= "#181c22"
+DIM     = "#3a4455";  MUTED   = "#6b7a8d"
+
+STATE_COL = {
+    "WARMUP":ACCENT,"AIR":GREEN,"MEASURING":YELLOW,
+    "GAS_ON":RED,"FALLING":ORANGE,"SETTLING":PURPLE,
+}
+
+# ── hardware constants ────────────────────────────────────────────────────────
+DT             = 0.0755
+TRIG_WIN       = 5          # fast-onset rolling window
+SLOPE_WIN      = 20         # measurement window — HARD STOP
+ONSET_THRESH   = 0.10       # mV/sample fast-onset threshold
+SLOW_THRESH    = 0.05       # mV/sample slow-onset per-sample threshold
+SLOW_CONSEC    = 10         # consecutive samples for slow onset
+FALL_THRESH    = -0.10      # mV/sample falling threshold
+FLAT_THRESH    = 0.05       # mV/sample flatness threshold
+FLAT_CONSEC    = 20         # samples of flatness → back to AIR
+WARMUP_SAMP    = int(3.0/DT)
+TIMER_SAMP     = 48
+MIN_DIFF_MV    = 0.5        # minimum |diff| per sample to include in mean
+
+# dual-feature weights
+W_SLOPE = 0.6
+W_EMF   = 0.4
+
+# ── calibration knowledge base ────────────────────────────────────────────────
+# Each entry: (slope_mVs, delta_emf_mV, target_ppm)
+# zero-slope anchor stays as (0.0, 0.0, baseline_ppm)
+FACTORY_CURVES = {
+    0:     [(0.0, 0.0, 0),
+            (1.78, 4.5,   100),
+            (6.08, 53.0,  1000),
+            (50.25,156.0, 5000),
+            (96.67,181.0, 10000),
+            (119.61,339.0,20000)],
+    100:   [(0.0, 0.0, 100),
+            (10.62,50.0, 1000),
+            (50.41,150.0,5000),
+            (93.16,178.0,10000),
+            (117.36,335.0,20000)],
+    1000:  [(0.0, 0.0, 1000),
+            (41.49,120.0,5000),
+            (85.45,165.0,10000),
+            (105.05,310.0,20000)],
+    5000:  [(0.0, 0.0, 5000),
+            (43.64,90.0, 10000),
+            (59.72,220.0,20000)],
+    10000: [(0.0, 0.0, 10000),
+            (31.80,130.0,20000)],
+}
+CALIBRATION_CURVES = copy.deepcopy(FACTORY_CURVES)
+CAL_AUTOSAVE = "h2_calibration_v11.json"
+
+CAL_SEQUENCE = [
+    (0,     100,   "Air → 100 ppm"),
+    (0,    1000,   "Air → 1000 ppm"),
+    (0,    5000,   "Air → 5000 ppm"),
+    (0,   10000,   "Air → 1% H₂"),
+    (0,   20000,   "Air → 2% H₂"),
+    (100,  1000,   "100 ppm → 1000 ppm"),
+    (1000, 5000,   "1000 ppm → 5000 ppm"),
+    (5000,10000,   "5000 ppm → 1% H₂"),
+]
+
+GAS_NAMES  = {0:"Air (0 ppm)",100:"100 ppm",1000:"1000 ppm",
+              5000:"5000 ppm",10000:"1% H₂ (10k)",20000:"2% H₂ (20k)"}
+PPM_LABELS = {0:"Air",100:"100",1000:"1k",5000:"5k",10000:"1%",20000:"2%"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HYBRID MATH  (v11: dual-feature slope + delta_emf)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _curve_anchors(state):
+    """Return list of (slope, delta_emf, ppm) excluding the zero anchor."""
+    return [(s, e, p) for s, e, p in CALIBRATION_CURVES.get(state, []) if s > 0]
+
+def piecewise_interp_2D(state, slope, delta_emf=None):
+    """
+    Smooth interpolation using slope (primary) and optionally delta_emf.
+    Returns continuous ppm estimate.
+    """
+    curve = CALIBRATION_CURVES.get(state, [])
+    if not curve:
+        return float(state)
+    slopes = [p[0] for p in curve]
+    ppms   = [p[2] for p in curve]
+    if slope > slopes[-1]:
+        return ppms[-1] * np.exp(0.01 * (slope - slopes[-1]))
+    return float(np.interp(slope, slopes, ppms))
+
+def dual_feature_match(state, slope, delta_emf, margin=0.15):
+    """
+    Dual-feature discrete matching.
+    Returns (matched_ppm, score, method) or (None, inf, 'none').
+    Score = weighted relative error across both features.
+    """
+    anchors = _curve_anchors(state)
+    if not anchors:
+        return None, float('inf'), 'none'
+
+    best_ppm   = None
+    best_score = float('inf')
+    best_method = 'none'
+
+    for (cal_slope, cal_emf, tgt_ppm) in anchors:
+        # Check slope bracket ±margin
+        in_slope_band = cal_slope*(1-margin) <= slope <= cal_slope*(1+margin)
+        # Score = relative error (lower = better match)
+        err_slope = abs(slope - cal_slope) / max(cal_slope, 0.01)
+        err_emf   = abs(delta_emf - cal_emf) / max(cal_emf, 0.1) if delta_emf is not None and cal_emf > 0 else err_slope
+        score = W_SLOPE*err_slope + W_EMF*err_emf
+
+        if in_slope_band and score < best_score:
+            best_score  = score
+            best_ppm    = tgt_ppm
+            best_method = 'slope+emf' if delta_emf is not None else 'slope'
+
+    return best_ppm, best_score, best_method
+
+def final_output(state, slope, delta_emf=None):
+    """
+    Hybrid output: smooth interpolation + optional discrete snap.
+    """
+    c_smooth   = piecewise_interp_2D(state, slope, delta_emf)
+    c_discrete, score, method = dual_feature_match(state, slope, delta_emf)
+
+    if c_discrete is not None:
+        return round(0.7*c_discrete + 0.3*c_smooth, 1), 'discrete', score
+    return round(c_smooth, 1), 'smooth', float('inf')
+
+def get_base_state(ppm_val):
+    for s in sorted(CALIBRATION_CURVES.keys(), reverse=True):
+        if ppm_val >= s * 0.8: return s
+    return 0
+
+def _interp_label(ppm):
+    if ppm < 10:   return "Air / ambient"
+    if ppm < 9000: return f"~{ppm:.0f} ppm H₂"
+    return f"~{ppm/10000:.2f}% H₂"
+
+def ppm_color(ppm):
+    if ppm <   10: return GREEN
+    if ppm <  300: return CYAN
+    if ppm < 1500: return YELLOW
+    if ppm < 8000: return ORANGE
+    return RED
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CALIBRATION MANAGER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CalibrationManager:
+    def __init__(self):
+        self._calibrated      = False
+        self._cal_baseline_mv = 28.0
+        self._try_load()
+
+    @property
+    def is_calibrated(self): return self._calibrated
+    @property
+    def cal_baseline_mv(self): return self._cal_baseline_mv
+
+    def build_from_wizard(self, measured_points, air_baseline_mv):
+        """
+        measured_points: list of (base_ppm, tgt_ppm, slope, delta_emf)
+        """
+        global CALIBRATION_CURVES
+        curves = copy.deepcopy(FACTORY_CURVES)
+        for base_ppm, tgt_ppm, slope, delta_emf in measured_points:
+            curve = curves.get(base_ppm, [(0.0, 0.0, base_ppm)])
+            curve = [p for p in curve if p[2] != tgt_ppm or p[0] == 0.0]
+            curve.append((round(slope, 4), round(delta_emf, 4), tgt_ppm))
+            curve.sort(key=lambda p: p[0])
+            curves[base_ppm] = curve
+        CALIBRATION_CURVES       = curves
+        self._calibrated         = True
+        self._cal_baseline_mv    = air_baseline_mv
+        self._autosave()
+
+    def update_single_point(self, base_ppm, tgt_ppm, new_slope, new_delta_emf):
+        curve   = CALIBRATION_CURVES.get(base_ppm, [])
+        updated = [(s, e, p) if p != tgt_ppm
+                   else (round(new_slope,4), round(new_delta_emf,4), p)
+                   for s,e,p in curve]
+        updated.sort(key=lambda p: p[0])
+        CALIBRATION_CURVES[base_ppm] = updated
+        self._autosave()
+
+    def reset_to_factory(self):
+        global CALIBRATION_CURVES
+        CALIBRATION_CURVES = copy.deepcopy(FACTORY_CURVES)
+        self._calibrated = False
+        if os.path.exists(CAL_AUTOSAVE): os.remove(CAL_AUTOSAVE)
+
+    def _autosave(self):
+        try:
+            data = {"curves":       {str(k): v for k, v in CALIBRATION_CURVES.items()},
+                    "air_baseline": self._cal_baseline_mv,
+                    "calibrated":   self._calibrated}
+            with open(CAL_AUTOSAVE, "w") as f: json.dump(data, f, indent=2)
+        except Exception: pass
+
+    def _try_load(self):
+        global CALIBRATION_CURVES
+        if not os.path.exists(CAL_AUTOSAVE): return
+        try:
+            with open(CAL_AUTOSAVE) as f: raw = json.load(f)
+            loaded = {}
+            for k, v in raw["curves"].items():
+                pts = []
+                for p in v:
+                    if len(p) == 3:
+                        pts.append(tuple(p))        # (slope, delta_emf, ppm)
+                    elif len(p) == 2:
+                        pts.append((p[0], 0.0, p[1]))  # legacy 2-tuple
+                loaded[int(k)] = pts
+            CALIBRATION_CURVES       = loaded
+            self._cal_baseline_mv    = raw.get("air_baseline", 28.0)
+            self._calibrated         = raw.get("calibrated", False)
+        except Exception: pass
+
+    def export_csv(self, path):
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["baseline_ppm","target_ppm","slope_mVs","delta_emf_mV","source"])
+            for state, curve in sorted(CALIBRATION_CURVES.items()):
+                fact_map = {p[2]: p[0] for p in FACTORY_CURVES.get(state, [])}
+                for slope, delta_emf, ppm in curve:
+                    w.writerow([state, ppm, slope, delta_emf,
+                                "factory" if fact_map.get(ppm) == slope else "user"])
+
+CAL_MGR = CalibrationManager()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SLOPE CAPTURE  v11  (MEAN_20 algorithm with TRIG_WIN delay + delta_emf)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SlopeCapture:
+    """
+    Fixed slope capture:
+      State machine: WARMUP → WAITING → DELAY → COLLECTING → DONE
+
+      WAITING  : watch for fast or slow onset
+      DELAY    : wait TRIG_WIN samples so diff_buf flushes stale baseline diffs
+      COLLECTING: accumulate exactly SLOPE_WIN dvdt samples (each only counted
+                  if |diff| >= MIN_DIFF_MV so noise doesn't pollute the mean)
+      DONE     : fire on_done(slope_mean, delta_emf)
+
+    Also records delta_emf = V[end_of_window] - V[onset].
+    """
+    def __init__(self, on_done, on_sample=None):
+        self._on_done      = on_done       # callback(slope, delta_emf)
+        self._on_sample    = on_sample     # callback(dvdt, state, count)
+        self._state        = "WARMUP"
+        self._diff_buf     = collections.deque(maxlen=TRIG_WIN)
+        self._slow_buf     = collections.deque(maxlen=SLOW_CONSEC)
+        self._prev_v       = None
+        self._count        = 0
+        self._delay_cnt    = 0
+        self._dvdt_samples = []
+        self._onset_v      = None
+        self._max_slope    = 0.0           # kept for live display
+        self._baseline_v   = collections.deque(maxlen=WARMUP_SAMP)
+        self._warmup_done  = False
+        self._air_baseline = 28.0
+
+    @property
+    def state(self): return self._state
+    @property
+    def max_slope(self):
+        if self._dvdt_samples:
+            return float(np.mean(self._dvdt_samples))
+        return self._max_slope
+    @property
+    def air_baseline(self): return self._air_baseline
+
+    def push(self, v):
+        if self._state == "DONE": return
+
+        # ── WARMUP ────────────────────────────────────────────────────────────
+        if not self._warmup_done:
+            self._baseline_v.append(v)
+            if len(self._baseline_v) >= WARMUP_SAMP:
+                self._air_baseline = float(np.mean(self._baseline_v))
+                self._warmup_done  = True
+                self._state        = "WAITING"
+            if self._on_sample: self._on_sample(0.0, "WARMUP", 0)
+            self._prev_v = v
+            return
+
+        diff = (v - self._prev_v) if self._prev_v is not None else 0.0
+        self._prev_v = v
+        self._diff_buf.append(diff)
+        self._slow_buf.append(diff)
+
+        dvdt = 0.0
+        if len(self._diff_buf) == TRIG_WIN:
+            dvdt = (sum(self._diff_buf) / TRIG_WIN) / DT
+
+        # ── WAITING ───────────────────────────────────────────────────────────
+        if self._state == "WAITING":
+            fast = dvdt > (ONSET_THRESH / DT)
+            slow = (len(self._slow_buf) == SLOW_CONSEC and
+                    all(d > SLOW_THRESH for d in self._slow_buf))
+            if fast or slow:
+                self._onset_v    = v
+                self._state      = "DELAY"
+                self._delay_cnt  = 0
+                self._dvdt_samples = []
+                self._max_slope  = dvdt
+
+        # ── DELAY: flush stale baseline diffs from diff_buf ───────────────────
+        elif self._state == "DELAY":
+            self._delay_cnt += 1
+            if self._delay_cnt >= TRIG_WIN:
+                self._state = "COLLECTING"
+                self._count = 0
+
+        # ── COLLECTING: mean of exactly SLOPE_WIN clean samples ───────────────
+        elif self._state == "COLLECTING":
+            # Only include if interval diff is large enough (your requirement)
+            if abs(diff) >= MIN_DIFF_MV:
+                self._dvdt_samples.append(dvdt)
+                self._max_slope = max(self._max_slope, dvdt)
+            self._count += 1    # always advance count regardless of gate
+
+            if self._count >= SLOPE_WIN:
+                slope_mean = float(np.mean(self._dvdt_samples)) if self._dvdt_samples else 0.0
+                delta_emf  = v - self._onset_v if self._onset_v is not None else 0.0
+                self._state = "DONE"
+                self._on_done(slope_mean, delta_emf)
+                return
+
+        if self._on_sample: self._on_sample(dvdt, self._state, self._count)
+
+    def reset(self):
+        """Restart capture for redo — preserves warmup/baseline."""
+        self._state        = "WAITING"
+        self._count        = 0
+        self._delay_cnt    = 0
+        self._dvdt_samples = []
+        self._max_slope    = 0.0
+        self._onset_v      = None
+        self._diff_buf.clear()
+        self._slow_buf.clear()
+        self._prev_v       = None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DETECTOR  v11
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Detector:
+    def __init__(self, dt=DT, baseline_ppm=0):
+        self.dt = dt; self.baseline_ppm = baseline_ppm
+        self.events = []; self._reset_all()
+
+    def set_baseline_ppm(self, ppm): self.baseline_ppm = ppm
+    def set_initial_baseline(self, mv): self.baseline_mv = mv
+
+    def _reset_all(self):
+        self.state            = "WARMUP"
+        self.cur_ppm          = 0
+        self.display_ppm      = 0.0
+        self.baseline_mv      = CAL_MGR.cal_baseline_mv
+        self._v_buf           = collections.deque(maxlen=SLOPE_WIN+TRIG_WIN+2)
+        self._diff_buf        = collections.deque(maxlen=TRIG_WIN)
+        self._slow_buf        = collections.deque(maxlen=SLOW_CONSEC)
+        self._measuring_count = 0
+        self._delay_count     = 0
+        self._dvdt_samples    = []
+        self._max_slope       = 0.0
+        self._onset_v         = None
+        self._delta_emf       = 0.0
+        self._flat_count      = 0
+        self._locked_bl       = CAL_MGR.cal_baseline_mv
+        self._timer_cnt       = 0
+        self._prev_v          = None
+        self._cur_label       = "Air / ambient"
+        self._cur_regime      = "—"
+        self._cur_regime_col  = SUB
+        self._cur_delta_v     = 0.0
+        self._discrete_hit    = False
+        self._match_score     = float('inf')
+        self._match_method    = "—"
+        self._pending_ev      = None
+        self._warmup_buf      = collections.deque(maxlen=WARMUP_SAMP)
+        self._warmup_done     = False
+
+    def reset(self): self._reset_all()
+
+    def push(self, v_mv):
+        self._v_buf.append(v_mv)
+        if self._prev_v is None: self._prev_v = v_mv
+        diff = v_mv - self._prev_v; self._prev_v = v_mv
+        self._diff_buf.append(diff); self._slow_buf.append(diff)
+        ev = None
+
+        dvdt_mVs = 0.0
+        if len(self._diff_buf) == TRIG_WIN:
+            dvdt_mVs = (sum(self._diff_buf) / TRIG_WIN) / self.dt
+
+        # ── WARMUP ────────────────────────────────────────────────────────────
+        if self.state == "WARMUP":
+            self._warmup_buf.append(v_mv)
+            if len(self._warmup_buf) >= WARMUP_SAMP and not self._warmup_done:
+                self.baseline_mv  = (CAL_MGR.cal_baseline_mv if CAL_MGR.is_calibrated
+                                     else float(np.mean(self._warmup_buf)))
+                self._locked_bl   = self.baseline_mv
+                self._warmup_done = True
+                self.state        = "AIR"
+
+        # ── AIR: rolling baseline (only here) ─────────────────────────────────
+        elif self.state == "AIR":
+            self.baseline_mv = self.baseline_mv * 0.99 + v_mv * 0.01
+            fast = dvdt_mVs > (ONSET_THRESH / self.dt)
+            slow = (len(self._slow_buf) == SLOW_CONSEC and
+                    all(d > SLOW_THRESH for d in self._slow_buf))
+            if fast or slow:
+                self._locked_bl       = self.baseline_mv
+                self._onset_v         = v_mv
+                self._timer_cnt       = 0
+                self._measuring_count = 0
+                self._delay_count     = 0
+                self._dvdt_samples    = []
+                self._max_slope       = dvdt_mVs
+                self.state            = "MEASURING"
+                ev = self._make_ev("ONSET_DETECTED", 0, 0.0,
+                    f"{'fast' if fast else 'slow'} onset @ {v_mv:.2f} mV")
+
+        # ── MEASURING: DELAY then COLLECT 20 samples ─────────────────────────
+        elif self.state == "MEASURING":
+            self._timer_cnt += 1
+
+            # Phase 1: DELAY — let diff_buf flush stale baseline diffs
+            if self._delay_count < TRIG_WIN:
+                self._delay_count += 1
+
+            # Phase 2: COLLECT exactly SLOPE_WIN samples
+            else:
+                # Only count if |diff| >= MIN_DIFF_MV
+                if abs(diff) >= MIN_DIFF_MV:
+                    self._dvdt_samples.append(dvdt_mVs)
+                    self._max_slope = max(self._max_slope, dvdt_mVs)
+                self._measuring_count += 1
+
+                if self._measuring_count >= SLOPE_WIN:
+                    # ── Compute final slope + delta_emf ────────────────────────
+                    slope_mean = (float(np.mean(self._dvdt_samples))
+                                  if self._dvdt_samples else 0.0)
+                    self._delta_emf    = v_mv - self._onset_v if self._onset_v else 0.0
+
+                    ppm, mode, score   = final_output(
+                        self.cur_ppm, slope_mean, self._delta_emf)
+                    self.display_ppm   = ppm
+                    self.cur_ppm       = get_base_state(ppm)
+                    self._cur_label    = _interp_label(ppm)
+                    self._discrete_hit = (mode == 'discrete')
+                    self._match_score  = score
+                    self._match_method = mode
+                    self._cur_delta_v  = v_mv - self._locked_bl
+                    self._cur_regime   = ("HIGH"   if slope_mean >= 40 else
+                                          "MEDIUM" if slope_mean >= 10 else "LOW")
+                    self._cur_regime_col = (GREEN  if self._cur_regime=="HIGH" else
+                                            YELLOW if self._cur_regime=="MEDIUM" else RED)
+                    self.state         = "GAS_ON"
+                    self._flat_count   = 0
+                    ev = self._make_ev("GAS_DETECTED", ppm, self._cur_delta_v,
+                        f"{self._cur_label}  [slope={slope_mean:.2f}  "
+                        f"Δemf={self._delta_emf:.1f}  "
+                        f"{'SNAP' if self._discrete_hit else 'INTERP'}]")
+
+        # ── GAS_ON: baseline FROZEN ────────────────────────────────────────────
+        elif self.state == "GAS_ON":
+            if dvdt_mVs > (ONSET_THRESH*10) / self.dt:
+                # Step-up: restart measurement
+                self._onset_v         = v_mv
+                self._measuring_count = 0
+                self._delay_count     = 0
+                self._dvdt_samples    = []
+                self._max_slope       = dvdt_mVs
+                self._timer_cnt       = 0
+                self.state            = "MEASURING"
+            elif dvdt_mVs < (FALL_THRESH / self.dt):
+                self.display_ppm = 0.0; self.cur_ppm = 0
+                self._cur_label  = "Air / Recovering…"
+                self._flat_count = 0
+                self.state       = "FALLING"
+                ev = self._make_ev("RECOVERY_STARTED", 0, 0.0, "falling")
+
+        # ── FALLING / SETTLING ────────────────────────────────────────────────
+        elif self.state in ("FALLING","SETTLING"):
+            if dvdt_mVs > 5.0:
+                self._onset_v         = v_mv
+                self._measuring_count = 0
+                self._delay_count     = 0
+                self._dvdt_samples    = []
+                self._max_slope       = dvdt_mVs
+                self._timer_cnt       = 0
+                self.state            = "MEASURING"
+            else:
+                if abs(diff) < FLAT_THRESH:
+                    self._flat_count += 1; self.state = "SETTLING"
+                    if self._flat_count >= FLAT_CONSEC:
+                        self.baseline_mv = float(np.mean(self._v_buf))
+                        self._locked_bl  = self.baseline_mv
+                        self.state       = "AIR"; self._flat_count = 0
+                        self._slow_buf.clear()
+                        ev = self._make_ev("BASELINE_UPDATED", 0, 0.0,
+                            f"new baseline: {self.baseline_mv:.2f} mV")
+                else:
+                    self._flat_count = 0; self.state = "FALLING"
+
+        if ev: self.events.append(ev)
+        return self._build_result(v_mv, dvdt_mVs)
+
+    def _build_result(self, v_mv, dvdt_mVs):
+        ppm = self.display_ppm
+        slope_now = (float(np.mean(self._dvdt_samples))
+                     if self._dvdt_samples else self._max_slope)
+        return {
+            "state": self.state, "v": v_mv, "diff_mvs": dvdt_mVs,
+            "baseline": self.baseline_mv, "locked_bl": self._locked_bl,
+            "timer": self._timer_cnt, "delta_v": self._cur_delta_v,
+            "delta_emf": self._delta_emf,
+            "ppm": ppm, "label": self._cur_label,
+            "in_band": self._discrete_hit,
+            "match_score": self._match_score,
+            "match_method": self._match_method,
+            "regime": self._cur_regime, "regime_col": self._cur_regime_col,
+            "slope_frozen": slope_now,
+            "meas_count": self._measuring_count,
+            "delay_count": self._delay_count,
+            "event": self._consume_pending_ev(),
+        }
+
+    def _consume_pending_ev(self):
+        ev = self._pending_ev; self._pending_ev = None; return ev
+
+    def _make_ev(self, kind, ppm, delta_v, note):
+        ev = {"kind":kind,"ppm":ppm,"delta_v":delta_v,"note":note,
+              "baseline":self._locked_bl}
+        self._pending_ev = ev; return ev
+
+
+# ── simulator ─────────────────────────────────────────────────────────────────
+SIM_DV48    = {0:0,100:8.0,1000:102.0,5000:300.0,10000:347.0,20000:650.0}
+SIM_PLATEAU = {0:0,100:30.0,1000:240.0,5000:420.0,10000:545.0,20000:1080.0}
+SIM_TAUR    = {0:1,100:11.7,1000:11.3,5000:10.4,10000:9.6,20000:8.7}
+SIM_TAUF    = {0:1,100:5.6,1000:4.3,5000:3.5,10000:3.0,20000:2.6}
+PPM_KEYS_SIM = sorted(SIM_DV48.keys())
+
+def _sim_interp(d, ppm):
+    return float(np.interp(ppm, np.array(PPM_KEYS_SIM,dtype=float),
+                           np.array([d[k] for k in PPM_KEYS_SIM],dtype=float)))
+
+class Simulator:
+    def generate(self, steps, baseline_mv=28.0, noise_std=0.08, dt=DT):
+        t_list, v_list, lbl_list = [], [], []; t=0.0; v=baseline_mv
+        for gas_ppm, duration_s in steps:
+            n = max(1, int(duration_s/dt))
+            if gas_ppm > 0:
+                target_v   = baseline_mv + _sim_interp(SIM_PLATEAU, gas_ppm)
+                target_v48 = baseline_mv + _sim_interp(SIM_DV48, gas_ppm)
+                ramp = (target_v48-v)/TIMER_SAMP; tau_r = _sim_interp(SIM_TAUR, gas_ppm)
+                for i in range(n):
+                    v_t = (v+ramp*(i+1) if i < TIMER_SAMP
+                           else target_v48+(target_v-target_v48)*(1-math.exp(-(i-TIMER_SAMP)*dt/tau_r)))
+                    t_list.append(round(t,4)); v_list.append(v_t+np.random.normal(0,noise_std))
+                    lbl_list.append(f"{gas_ppm}ppm"); t+=dt
+                v = target_v
+            else:
+                tau_f=_sim_interp(SIM_TAUF,max(gas_ppm,100)); sd=v-baseline_mv
+                for i in range(n):
+                    t_list.append(round(t,4))
+                    v_list.append(baseline_mv+sd*math.exp(-i*dt/tau_f)+np.random.normal(0,noise_std))
+                    lbl_list.append("air"); t+=dt
+                v = baseline_mv
+        return np.array(t_list), np.array(v_list), lbl_list
+
+# ── log tailer ────────────────────────────────────────────────────────────────
+DATA_RE = re.compile(r'^\s*[+-]?\d+\.\d+\s+([+-]\d+\.\d+)')
+
+class LogTailer:
+    def __init__(self, path):
+        self.path=path; self._buf=collections.deque()
+        self._stop=threading.Event(); self._lock=threading.Lock()
+        self._th=threading.Thread(target=self._run, daemon=True)
+    def start(self): self._th.start()
+    def stop(self): self._stop.set()
+    def _run(self):
+        try: f=open(self.path,"r",errors="replace"); f.seek(0,2)
+        except: return
+        rem=""
+        while not self._stop.is_set():
+            chunk=f.read(4096)
+            if chunk:
+                rem+=chunk; lines=rem.split("\n"); rem=lines[-1]
+                for line in lines[:-1]:
+                    m=DATA_RE.match(line)
+                    if m:
+                        try:
+                            with self._lock: self._buf.append(float(m.group(1)))
+                        except: pass
+            else: time.sleep(0.02)
+        f.close()
+    def get_new(self):
+        with self._lock: d=list(self._buf); self._buf.clear(); return d
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GUIDED CALIBRATION WIZARD  v11
+# Stores (slope, delta_emf) per step. Shows both values after capture.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class GuidedCalibrationWizard(tk.Frame):
+    CHART_INTERVAL_MS = 250
+
+    def __init__(self, parent, on_complete=None, on_reset=None):
+        super().__init__(parent, bg=BG)
+        self._on_complete  = on_complete
+        self._on_reset     = on_reset
+        self._step_idx     = -1
+        self._measured     = []     # list of (base, tgt, slope, delta_emf)
+        self._capturer     = None
+        self._tailer       = None
+        self._tick_job     = None
+        self._chart_job    = None
+        self._dvdt_hist    = collections.deque(maxlen=400)
+        self._v_hist       = collections.deque(maxlen=400)
+        self._t_hist       = collections.deque(maxlen=400)
+        self._t_elapsed    = 0.0
+        self._streaming    = False
+        self._chart_dirty  = False
+        self._wiz_state    = "idle"
+        self._last_slope   = 0.0
+        self._last_delta   = 0.0
+        self._build()
+
+    def _build(self):
+        hdr = tk.Frame(self, bg=SURFACE, pady=6); hdr.pack(fill="x", pady=(0,4))
+        tk.Label(hdr, text="  🔬  Guided Calibration Wizard  v11",
+                 font=("Courier New",13,"bold"), fg=TEAL, bg=SURFACE).pack(side="left")
+        self._hdr_badge = tk.Label(hdr, text="● NOT CALIBRATED",
+                                   font=("Courier New",10,"bold"), fg=RED, bg=SURFACE, padx=12)
+        self._hdr_badge.pack(side="right")
+
+        body = tk.Frame(self, bg=BG); body.pack(fill="both", expand=True)
+        left = tk.Frame(body, bg=BG, width=500)
+        left.pack(side="left", fill="y", padx=(0,6)); left.pack_propagate(False)
+        right = tk.Frame(body, bg=BG); right.pack(side="left", fill="both", expand=True)
+        self._build_intro(left)
+        self._build_step_panel(left)
+        self._build_results_panel(left)
+        self._build_chart(right)
+
+    def _build_intro(self, parent):
+        card = self._card(parent, "HOW TO CALIBRATE")
+        tk.Label(card,
+            text=("1. Open Log File or Simulator.\n"
+                  "2. Keep sensor in clean AIR ≥5 s.\n"
+                  "3. START CALIBRATION — expose to each target gas.\n"
+                  "4. Wizard captures slope (mean of 20 samples) AND Δ EMF.\n"
+                  "5. ✅ Accept or 🔁 Redo before advancing.\n"
+                  "6. Both features used for detection accuracy."),
+            font=("Courier New",9), fg=MUTED, bg=SURFACE, justify="left", wraplength=460,
+        ).pack(anchor="w", padx=12, pady=(6,8))
+        row = tk.Frame(card, bg=SURFACE); row.pack(fill="x", padx=12, pady=(0,10))
+        for lbl, bg, fg, cmd in [
+            ("📂  Live Log",   ACCENT, BG,   self._open_live),
+            ("🧪  Simulator",  PURPLE, TEXT, self._open_sim),
+            ("📥  Load Saved", BORDER, TEXT, self._load_saved),
+        ]:
+            tk.Button(row, text=lbl, font=("Courier New",9,"bold"),
+                      bg=bg, fg=fg, relief="flat", cursor="hand2",
+                      padx=10, pady=6, command=cmd).pack(side="left", padx=(0,6))
+
+    def _build_step_panel(self, parent):
+        card = self._card(parent, "CALIBRATION STEPS")
+
+        self._inst_lbl = tk.Label(card,
+            text="Press START to begin.",
+            font=("Courier New",10,"bold"), fg=TEXT, bg=SURFACE,
+            wraplength=460, justify="left")
+        self._inst_lbl.pack(anchor="w", padx=12, pady=(8,4))
+
+        pr = tk.Frame(card, bg=SURFACE); pr.pack(fill="x", padx=12, pady=(0,4))
+        tk.Label(pr, text="Progress:", font=("Courier New",8), fg=MUTED, bg=SURFACE).pack(side="left")
+        self._prog_str = tk.StringVar(value="0 / 0")
+        tk.Label(pr, textvariable=self._prog_str, font=("Courier New",8,"bold"),
+                 fg=TEAL, bg=SURFACE).pack(side="left", padx=6)
+        self._prog_cv = tk.Canvas(card, bg=BORDER, height=8, width=460, highlightthickness=0)
+        self._prog_cv.pack(padx=12, pady=(0,6))
+        self._prog_bar = self._prog_cv.create_rectangle(0,0,0,8, fill=TEAL, outline="")
+
+        # Live readings — show both slope AND delta_emf
+        for lbl_txt, var_attr, col in [
+            ("Live dV/dt (mV/s):", "_live_slope_str", TEAL),
+            ("Max slope so far:",  "_max_slope_str",  GREEN),
+            ("Δ EMF so far (mV):", "_live_emf_str",   ACCENT),
+        ]:
+            row = tk.Frame(card, bg=SURFACE2); row.pack(fill="x", padx=12, pady=1)
+            tk.Label(row, text=lbl_txt, font=("Courier New",9), fg=MUTED,
+                     bg=SURFACE2, padx=8, pady=5).pack(side="left")
+            var = tk.StringVar(value="—"); setattr(self, var_attr, var)
+            tk.Label(row, textvariable=var, font=("Courier New",12,"bold"),
+                     fg=col, bg=SURFACE2, padx=8).pack(side="right")
+
+        self._cap_str = tk.StringVar(value="")
+        self._cap_lbl = tk.Label(card, textvariable=self._cap_str,
+                                  font=("Courier New",9), fg=YELLOW, bg=SURFACE, pady=2)
+        self._cap_lbl.pack(anchor="w", padx=12)
+
+        # ── CONFIRM FRAME ─────────────────────────────────────────────────────
+        self._confirm_frame = tk.Frame(card, bg="#0d1a0a", pady=6)
+        self._confirm_frame.pack(fill="x", padx=12, pady=2)
+        tk.Label(self._confirm_frame, text="  ▼ Confirm captured values:",
+                 font=("Courier New",10,"bold"), fg=GREEN, bg="#0d1a0a"
+                 ).pack(side="left", padx=6)
+        self._accept_btn = tk.Button(self._confirm_frame,
+            text="✅  Accept & Continue",
+            font=("Courier New",10,"bold"), bg=GREEN, fg="#0a0c0f",
+            relief="flat", cursor="hand2", padx=12, pady=8,
+            command=self._accept_step)
+        self._accept_btn.pack(side="left", padx=(0,6))
+        self._redo_btn = tk.Button(self._confirm_frame,
+            text="🔁  Redo This Step",
+            font=("Courier New",10,"bold"), bg=ORANGE, fg="#0a0c0f",
+            relief="flat", cursor="hand2", padx=12, pady=8,
+            command=self._redo_step)
+        self._redo_btn.pack(side="left")
+        self._confirm_frame.pack_forget()   # hidden until capture
+
+        ctrl = tk.Frame(card, bg=SURFACE); ctrl.pack(fill="x", padx=12, pady=(6,4))
+        self._start_btn = tk.Button(ctrl, text="▶  START CALIBRATION",
+            font=("Courier New",11,"bold"), bg=TEAL, fg="#0a0c0f",
+            relief="flat", cursor="hand2", padx=12, pady=10,
+            command=self._start_cal)
+        self._start_btn.pack(side="left", fill="x", expand=True, padx=(0,6))
+        self._skip_btn = tk.Button(ctrl, text="⏭  Skip",
+            font=("Courier New",9), bg=BORDER, fg=TEXT,
+            relief="flat", cursor="hand2", padx=10, pady=10,
+            state="disabled", command=self._skip_step)
+        self._skip_btn.pack(side="left", padx=(0,6))
+        self._finish_btn = tk.Button(ctrl, text="✅  Finish",
+            font=("Courier New",9,"bold"), bg=GREEN, fg="#0a0c0f",
+            relief="flat", cursor="hand2", padx=10, pady=10,
+            state="disabled", command=self._finish_cal)
+        self._finish_btn.pack(side="left")
+
+        ctrl2 = tk.Frame(card, bg=SURFACE); ctrl2.pack(fill="x", padx=12, pady=(0,8))
+        self._stop_graph_btn = tk.Button(ctrl2, text="⏹  Stop Live Graph",
+            font=("Courier New",9), bg=BORDER, fg=TEXT,
+            relief="flat", cursor="hand2", padx=10, pady=6,
+            state="disabled", command=self._stop_graph)
+        self._stop_graph_btn.pack(side="left", padx=(0,6))
+        tk.Button(ctrl2, text="🏭  Reset / Start Over",
+            font=("Courier New",9), bg=RED, fg=TEXT,
+            relief="flat", cursor="hand2", padx=10, pady=6,
+            command=self._reset_cal).pack(side="left")
+
+    def _build_results_panel(self, parent):
+        card = self._card(parent, "CAPTURED SLOPES + Δ EMF")
+        frm  = tk.Frame(card, bg=SURFACE2); frm.pack(fill="both", expand=True, padx=8, pady=6)
+        cols = ("step","baseline","target","slope","delta_emf","status")
+        hdrs = ("#","Baseline","Target","Slope (mV/s)","Δ EMF (mV)","Status")
+        style = ttk.Style(); style.theme_use("clam")
+        style.configure("CalWiz.Treeview",
+                        background=SURFACE2, foreground=MUTED,
+                        fieldbackground=SURFACE2, rowheight=24,
+                        font=("Courier New",9))
+        style.configure("CalWiz.Treeview.Heading",
+                        background=DIM, foreground=TEAL,
+                        font=("Courier New",9,"bold"), relief="flat")
+        self._results_tree = ttk.Treeview(frm, columns=cols, show="headings",
+                                           style="CalWiz.Treeview", height=8)
+        ws = [28,130,130,100,100,80]
+        for col,hdr,w in zip(cols,hdrs,ws):
+            self._results_tree.heading(col, text=hdr)
+            self._results_tree.column(col, width=w, anchor="center")
+        self._results_tree.tag_configure("done",    foreground=GREEN)
+        self._results_tree.tag_configure("skipped", foreground=MUTED)
+        self._results_tree.tag_configure("active",  foreground=YELLOW, background=DIM)
+        self._results_tree.tag_configure("pending", foreground=BORDER)
+        self._results_tree.tag_configure("confirm", foreground=ORANGE, background="#1a0f00")
+        vsb = ttk.Scrollbar(frm, orient="vertical", command=self._results_tree.yview)
+        self._results_tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y"); self._results_tree.pack(fill="both", expand=True)
+        btn_row = tk.Frame(card, bg=SURFACE); btn_row.pack(fill="x", padx=8, pady=(0,6))
+        tk.Button(btn_row, text="📤  Export CSV",
+                  font=("Courier New",9), bg=YELLOW, fg="#0a0c0f",
+                  relief="flat", cursor="hand2", padx=10, pady=5,
+                  command=self._export_csv).pack(side="left")
+
+    def _build_chart(self, parent):
+        card = self._card(parent, "LIVE SIGNAL  —  V (mV) and dV/dt during calibration")
+        card.pack(fill="both", expand=True)
+        self._fig = Figure(figsize=(6,4), facecolor=SURFACE)
+        gs2 = self._fig.add_gridspec(2,1, hspace=0.48,
+                                     left=0.10, right=0.97, top=0.92, bottom=0.10)
+        self._ax_v    = self._fig.add_subplot(gs2[0])
+        self._ax_dvdt = self._fig.add_subplot(gs2[1])
+        for ax in (self._ax_v, self._ax_dvdt):
+            ax.set_facecolor(SURFACE)
+            ax.grid(True, color=BORDER, lw=0.5, ls="--", alpha=0.5)
+            for sp in ax.spines.values(): sp.set_color(BORDER)
+            ax.tick_params(colors=MUTED, labelsize=8)
+        self._ax_v.set_title("Sensor V (mV)", fontsize=9, color=MUTED, fontfamily="monospace")
+        self._ax_dvdt.set_title("dV/dt (mV/s)  — teal=fast / yellow=slow onset",
+                                fontsize=8, color=MUTED, fontfamily="monospace")
+        self._ax_dvdt.set_xlabel("Elapsed (s)", fontsize=8, color=MUTED)
+        self._ax_dvdt.axhline(ONSET_THRESH/DT, color=TEAL,   lw=1.0, ls="--", alpha=0.8)
+        self._ax_dvdt.axhline(SLOW_THRESH/DT,  color=YELLOW, lw=0.8, ls=":",  alpha=0.7)
+        self._ax_dvdt.axhline(0, color=BORDER, lw=0.6, ls="--")
+        self._ln_v,    = self._ax_v.plot([], [], color=ACCENT, lw=1.0)
+        self._ln_dvdt, = self._ax_dvdt.plot([], [], color=TEAL, lw=1.0)
+        self._canvas_cal = FigureCanvasTkAgg(self._fig, master=card)
+        self._canvas_cal.get_tk_widget().pack(fill="both", expand=True, padx=8, pady=8)
+
+    # ── show / hide confirm ───────────────────────────────────────────────────
+    def _show_confirm(self):
+        self._confirm_frame.pack(fill="x", padx=12, pady=4)
+    def _hide_confirm(self):
+        self._confirm_frame.pack_forget()
+
+    # ── step flow ─────────────────────────────────────────────────────────────
+    def _populate_seq_table(self):
+        for item in self._results_tree.get_children(): self._results_tree.delete(item)
+        self._tree_ids = []
+        for i,(base,tgt,lbl) in enumerate(CAL_SEQUENCE):
+            iid = self._results_tree.insert("","end",
+                values=(i+1, GAS_NAMES.get(base,"?"), GAS_NAMES.get(tgt,"?"),
+                        "—","—","pending"), tags=("pending",))
+            self._tree_ids.append(iid)
+
+    def _mark_row(self, idx, tag, slope="—", delta_emf="—", status="pending"):
+        if idx < 0 or idx >= len(self._tree_ids): return
+        iid  = self._tree_ids[idx]
+        vals = list(self._results_tree.item(iid,"values"))
+        vals[3]=slope; vals[4]=delta_emf; vals[5]=status
+        self._results_tree.item(iid, values=vals, tags=(tag,))
+
+    def _start_cal(self):
+        if not self._streaming:
+            messagebox.showwarning("No Signal","Open a log file or simulator first.",parent=self); return
+        self._measured=[]; self._step_idx=-1
+        self._populate_seq_table()
+        self._start_btn.config(state="disabled")
+        self._skip_btn.config(state="normal")
+        self._finish_btn.config(state="normal")
+        self._wiz_state="running"
+        self._advance_step()
+
+    def _advance_step(self):
+        self._step_idx += 1
+        if self._step_idx >= len(CAL_SEQUENCE):
+            self._finish_cal(); return
+        base, tgt, lbl = CAL_SEQUENCE[self._step_idx]
+        for i in range(len(self._tree_ids)):
+            if   i == self._step_idx: self._mark_row(i,"active","—","—","● ACTIVE")
+            elif i  > self._step_idx: self._mark_row(i,"pending","—","—","pending")
+        self._inst_lbl.config(
+            text=f"Step {self._step_idx+1}/{len(CAL_SEQUENCE)}:  {lbl}\n"
+                 f"Expose sensor to  {GAS_NAMES.get(tgt,'?')}\n"
+                 f"Waiting for gas onset…  (DELAY {TRIG_WIN} samples, then MEAN of {SLOPE_WIN})",
+            fg=YELLOW)
+        self._cap_str.set("⏳  Waiting for onset…")
+        self._max_slope_str.set("—"); self._live_emf_str.set("—")
+        self._update_progress(self._step_idx)
+        self._hide_confirm(); self._wiz_state="running"
+        self._capturer = SlopeCapture(
+            on_done=self._step_captured,
+            on_sample=self._cap_sample_update)
+
+    def _cap_sample_update(self, dvdt, state, count):
+        self._live_slope_str.set(f"{dvdt:.2f}")
+        if state == "COLLECTING" and self._capturer:
+            self._cap_str.set(f"🔴  COLLECTING  {count}/{SLOPE_WIN}")
+            self._max_slope_str.set(f"{self._capturer.max_slope:.3f}")
+        elif state == "DELAY":
+            self._cap_str.set(f"⏱  DELAY (buffer flush)  {self._capturer._delay_cnt}/{TRIG_WIN}")
+
+    def _step_captured(self, slope, delta_emf):
+        """SlopeCapture fires on_done(slope_mean, delta_emf)."""
+        self._last_slope = slope; self._last_delta = delta_emf
+        base, tgt, lbl  = CAL_SEQUENCE[self._step_idx]
+        self._mark_row(self._step_idx, "confirm",
+                       f"{slope:.3f}", f"{delta_emf:.2f}", "⚠  CONFIRM?")
+        self._inst_lbl.config(
+            text=f"Step {self._step_idx+1}  —  {lbl}\n"
+                 f"Mean slope (20pt):  {slope:.3f} mV/s\n"
+                 f"Δ EMF (20pt):       {delta_emf:.2f} mV\n\n"
+                 f"✅  Accept to save.   🔁  Redo to repeat.",
+            fg=ORANGE)
+        self._cap_str.set(f"⚠  Awaiting confirmation")
+        self._max_slope_str.set(f"{slope:.3f}")
+        self._live_emf_str.set(f"{delta_emf:.2f}")
+        self._wiz_state="awaiting_confirm"
+        self._show_confirm()
+
+    def _accept_step(self):
+        if self._wiz_state != "awaiting_confirm": return
+        slope = self._last_slope; delta = self._last_delta
+        base, tgt, lbl = CAL_SEQUENCE[self._step_idx]
+        self._measured.append((base, tgt, slope, delta))
+        self._mark_row(self._step_idx,"done",f"{slope:.3f}",f"{delta:.2f}","✓  DONE")
+        self._hide_confirm()
+        self._inst_lbl.config(
+            text=f"✓  Step {self._step_idx+1} accepted\n"
+                 f"   slope={slope:.3f} mV/s  Δemf={delta:.2f} mV\n"
+                 f"   Advancing…",
+            fg=GREEN)
+        self._wiz_state="running"
+        self.after(700, self._advance_step)
+
+    def _redo_step(self):
+        if self._wiz_state != "awaiting_confirm": return
+        base, tgt, lbl = CAL_SEQUENCE[self._step_idx]
+        self._mark_row(self._step_idx,"active","—","—","● REDO")
+        self._hide_confirm()
+        self._inst_lbl.config(
+            text=f"🔁  Redo — Step {self._step_idx+1}:  {lbl}\n"
+                 f"Return to {GAS_NAMES.get(base,'baseline')}, re-expose.\n"
+                 f"Waiting for onset…",
+            fg=YELLOW)
+        self._cap_str.set("⏳  Waiting for new onset…")
+        self._max_slope_str.set("—"); self._live_emf_str.set("—")
+        self._wiz_state="running"
+        self._capturer.reset()
+
+    def _skip_step(self):
+        if self._step_idx < 0 or self._step_idx >= len(CAL_SEQUENCE): return
+        self._hide_confirm()
+        self._mark_row(self._step_idx,"skipped","—","—","SKIPPED")
+        self._capturer=None; self._wiz_state="running"
+        self.after(200, self._advance_step)
+
+    def _update_progress(self, done):
+        total=len(CAL_SEQUENCE); frac=done/total if total else 0
+        self._prog_str.set(f"{done} / {total}")
+        self._prog_cv.coords(self._prog_bar, 0,0, int(460*frac), 8)
+
+    def _finish_cal(self):
+        if not self._measured:
+            messagebox.showwarning("No Data","No steps completed.",parent=self)
+            self._start_btn.config(state="normal")
+            self._skip_btn.config(state="disabled")
+            self._finish_btn.config(state="disabled")
+            return
+        air_bl = self._capturer.air_baseline if self._capturer else 28.0
+        CAL_MGR.build_from_wizard(self._measured, air_bl)
+        self._hdr_badge.config(text="● CALIBRATED", fg=GREEN)
+        self._update_progress(len(CAL_SEQUENCE))
+        self._inst_lbl.config(
+            text=f"✅  Calibration complete!\n"
+                 f"   {len(self._measured)} steps  (slope + Δ EMF both stored)\n"
+                 f"   Saved → {CAL_AUTOSAVE}\n"
+                 f"   Detection tab UNLOCKED.",
+            fg=GREEN)
+        self._cap_str.set(""); self._hide_confirm()
+        self._start_btn.config(state="normal")
+        self._skip_btn.config(state="disabled")
+        self._finish_btn.config(state="disabled")
+        self._stop_graph_btn.config(state="normal")
+        self._wiz_state="done"
+        if self._on_complete: self._on_complete()
+
+    def _stop_graph(self):
+        self._stop_stream()
+        self._stop_graph_btn.config(state="disabled")
+        self._cap_str.set("📊  Live graph stopped — data preserved.")
+
+    def _reset_cal(self):
+        if not messagebox.askyesno("Reset","Discard all calibration data?",parent=self): return
+        CAL_MGR.reset_to_factory()
+        self._measured=[]; self._step_idx=-1; self._capturer=None; self._wiz_state="idle"
+        self._hdr_badge.config(text="● NOT CALIBRATED", fg=RED)
+        self._populate_seq_table()
+        self._inst_lbl.config(text="Press START to begin.", fg=TEXT)
+        self._cap_str.set(""); self._max_slope_str.set("—")
+        self._live_slope_str.set("—"); self._live_emf_str.set("—")
+        self._prog_str.set("0 / 0"); self._prog_cv.coords(self._prog_bar,0,0,0,8)
+        self._start_btn.config(state="normal")
+        self._skip_btn.config(state="disabled"); self._finish_btn.config(state="disabled")
+        self._stop_graph_btn.config(state="disabled"); self._hide_confirm()
+        if self._on_reset: self._on_reset()
+
+    # ── streaming ─────────────────────────────────────────────────────────────
+    def push_sample(self, v):
+        self._t_elapsed += DT
+        self._v_hist.append(v); self._t_hist.append(self._t_elapsed)
+        dv = (v-self._v_hist[-2])/DT if len(self._v_hist)>=2 else 0.0
+        self._dvdt_hist.append(dv)
+        if self._capturer and self._capturer.state != "DONE" and self._wiz_state=="running":
+            self._capturer.push(v)
+        self._chart_dirty = True
+
+    def _scheduled_chart_draw(self):
+        if self._chart_dirty:
+            self._chart_dirty = False
+            t=list(self._t_hist); v=list(self._v_hist); dv=list(self._dvdt_hist)
+            if t:
+                self._ln_v.set_data(t,v); self._ln_dvdt.set_data(t,dv)
+                for ax,vals in [(self._ax_v,v),(self._ax_dvdt,dv)]:
+                    ax.set_xlim(t[0], max(t[-1],t[0]+5))
+                    rng=max(vals)-min(vals) if len(vals)>1 else 1
+                    pad=max(rng*0.15, 0.5)
+                    ax.set_ylim(min(vals)-pad, max(vals)+pad)
+                self._canvas_cal.draw_idle()
+        self._chart_job = self.after(self.CHART_INTERVAL_MS, self._scheduled_chart_draw)
+
+    def _open_live(self):
+        path=filedialog.askopenfilename(title="Open log file",
+            filetypes=[("Log","*.log *.txt"),("All","*.*")])
+        if not path: return
+        self._stop_stream()
+        self._tailer=LogTailer(path); self._tailer.start()
+        self._streaming=True; self._tick_live(); self._scheduled_chart_draw()
+
+    def _tick_live(self):
+        if not self._streaming or not self._tailer: return
+        for v in self._tailer.get_new(): self.push_sample(v)
+        self._tick_job=self.after(60, self._tick_live)
+
+    def _open_sim(self):
+        sim=Simulator(); steps=[(0,30)]
+        for _,tgt,_ in CAL_SEQUENCE: steps.append((tgt,90)); steps.append((0,60))
+        _,v_arr,_=sim.generate(steps, baseline_mv=28.0, noise_std=0.05)
+        self._streaming=True; self._sim_data=v_arr; self._sim_idx=0
+        self._scheduled_chart_draw(); self._tick_sim()
+
+    def _tick_sim(self):
+        if not self._streaming or not hasattr(self,"_sim_data"): return
+        if self._sim_idx>=len(self._sim_data): self._streaming=False; return
+        self.push_sample(self._sim_data[self._sim_idx]); self._sim_idx+=1
+        self._tick_job=self.after(20, self._tick_sim)
+
+    def _stop_stream(self):
+        if self._tick_job:  self.after_cancel(self._tick_job);  self._tick_job=None
+        if self._chart_job: self.after_cancel(self._chart_job); self._chart_job=None
+        if self._tailer:    self._tailer.stop(); self._tailer=None
+        self._streaming=False
+
+    def _load_saved(self):
+        if not CAL_MGR.is_calibrated:
+            messagebox.showinfo("No Saved Cal",f"No file found.\n({CAL_AUTOSAVE})",parent=self); return
+        self._hdr_badge.config(text="● CALIBRATED (loaded)", fg=GREEN)
+        self._populate_seq_table()
+        self._inst_lbl.config(text="✅  Saved calibration loaded.\nDetection UNLOCKED.", fg=GREEN)
+        self._stop_graph_btn.config(state="normal")
+        if self._on_complete: self._on_complete()
+
+    def _export_csv(self):
+        path=filedialog.asksaveasfilename(defaultextension=".csv",
+            filetypes=[("CSV","*.csv")], initialfile="calibration_v11.csv",parent=self)
+        if not path: return
+        CAL_MGR.export_csv(path)
+        messagebox.showinfo("Exported",f"Saved to:\n{path}",parent=self)
+
+    def _card(self, parent, label):
+        outer=tk.Frame(parent, bg=BORDER, padx=1, pady=1)
+        inner=tk.Frame(outer, bg=SURFACE); inner.pack(fill="both",expand=True)
+        tk.Label(inner, text=f"  {label}", font=("Courier New",8,"bold"),
+                 fg=MUTED, bg=SURFACE, anchor="w", pady=5).pack(fill="x")
+        tk.Frame(inner, bg=BORDER, height=1).pack(fill="x")
+        outer.pack(fill="both",expand=False)
+        return inner
+
+    def on_destroy(self): self._stop_stream()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CALIBRATION CURVES TAB  (v11: adds slope vs delta_emf 2D scatter)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CalibrationCurvesTab(tk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent, bg=BG)
+        self._fit_type   = tk.StringVar(value="linear-interp")
+        self._entry_vars = {}
+        self._build(); self.refresh()
+
+    def _build(self):
+        tb=tk.Frame(self, bg=PANEL, pady=4); tb.pack(fill="x")
+        tk.Label(tb, text="  Fit type:", font=("Courier New",9), fg=MUTED, bg=PANEL).pack(side="left")
+        cb=ttk.Combobox(tb, textvariable=self._fit_type,
+                        values=["linear-interp","power-law","michaelis-menten"],
+                        state="readonly", width=20, font=("Courier New",9))
+        cb.pack(side="left", padx=4)
+        cb.bind("<<ComboboxSelected>>", lambda e: self.refresh())
+        for lbl,bg,fg,cmd in [
+            ("🔄  Refresh", TEAL,  "#0a0c0f", lambda: self.refresh()),
+            ("📤  PNG",     YELLOW,"#0a0c0f", self._export_png),
+            ("📤  CSV",     BORDER,TEXT,       self._export_csv),
+        ]:
+            tk.Button(tb, text=lbl, font=("Courier New",8,"bold"),
+                      bg=bg, fg=fg, relief="flat", cursor="hand2",
+                      padx=8, pady=4, command=cmd).pack(side="left", padx=4)
+        tk.Label(tb, text="Green=user  Grey=factory  ·  Edit slopes/Δemf → Refit",
+                 font=("Courier New",7), fg=MUTED, bg=PANEL).pack(side="right", padx=12)
+
+        nb = ttk.Notebook(self); nb.pack(fill="both", expand=True)
+
+        # Tab A: slope vs ppm
+        tab_a = tk.Frame(nb, bg=BG); nb.add(tab_a, text="Slope vs ppm")
+        self._fig_slope = Figure(facecolor=BG)
+        self._canvas_slope = FigureCanvasTkAgg(self._fig_slope, master=tab_a)
+        self._canvas_slope.get_tk_widget().pack(side="left",fill="both",expand=True)
+        right_a = tk.Frame(tab_a, bg=PANEL, width=330)
+        right_a.pack(side="right",fill="y"); right_a.pack_propagate(False)
+        self._build_edit_panel(right_a)
+
+        # Tab B: slope vs delta_emf  (new 2D scatter)
+        tab_b = tk.Frame(nb, bg=BG); nb.add(tab_b, text="Slope vs Δ EMF (2D)")
+        self._fig_2d = Figure(facecolor=BG)
+        self._canvas_2d = FigureCanvasTkAgg(self._fig_2d, master=tab_b)
+        self._canvas_2d.get_tk_widget().pack(fill="both",expand=True)
+
+    def _build_edit_panel(self, parent):
+        tk.Label(parent, text="  Edit Calibration Values",
+                 font=("Courier New",9,"bold"), fg=TEAL, bg=PANEL, pady=8).pack(fill="x")
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill="x")
+        cvs=tk.Canvas(parent, bg=PANEL, highlightthickness=0)
+        sb=ttk.Scrollbar(parent, orient="vertical", command=cvs.yview)
+        self._edit_inner=tk.Frame(cvs, bg=PANEL)
+        self._edit_inner.bind("<Configure>",
+            lambda e: cvs.configure(scrollregion=cvs.bbox("all")))
+        cvs.create_window((0,0), window=self._edit_inner, anchor="nw")
+        cvs.configure(yscrollcommand=sb.set)
+        sb.pack(side="right",fill="y"); cvs.pack(fill="both",expand=True,padx=4,pady=4)
+        tk.Button(parent, text="✅  Apply & Refit",
+                  font=("Courier New",9,"bold"), bg=GREEN, fg="#0a0c0f",
+                  relief="flat", cursor="hand2", pady=8,
+                  command=self._apply_edits).pack(fill="x", padx=8, pady=6)
+        tk.Button(parent, text="🏭  Restore Factory",
+                  font=("Courier New",8), bg=RED, fg=TEXT,
+                  relief="flat", cursor="hand2", pady=6,
+                  command=self._restore_factory).pack(fill="x", padx=8, pady=(0,6))
+
+    def _rebuild_edit_table(self):
+        for w in self._edit_inner.winfo_children(): w.destroy()
+        self._entry_vars.clear()
+        fact_map = {(b,p[2]):(p[0],p[1]) for b,c in FACTORY_CURVES.items() for p in c}
+        for base in sorted(CALIBRATION_CURVES.keys()):
+            hdr=tk.Frame(self._edit_inner, bg=DIM); hdr.pack(fill="x",pady=(8,2))
+            tk.Label(hdr, text=f"  Baseline: {GAS_NAMES.get(base,str(base))}",
+                     font=("Courier New",8,"bold"), fg=TEAL, bg=DIM, pady=4).pack(side="left")
+            for slope,delta_emf,ppm in CALIBRATION_CURVES[base]:
+                if slope==0.0: continue
+                fact  = fact_map.get((base,ppm))
+                is_u  = fact is None or fact[0] != slope
+                row   = tk.Frame(self._edit_inner, bg=SURFACE2); row.pack(fill="x",pady=1)
+                tk.Label(row, text=f"→{PPM_LABELS.get(ppm,str(ppm))}",
+                         font=("Courier New",8), fg=MUTED, bg=SURFACE2,
+                         width=7, anchor="w", padx=4).pack(side="left")
+                sv=tk.StringVar(value=f"{slope:.4f}")
+                ev_k=tk.StringVar(value=f"{delta_emf:.2f}")
+                self._entry_vars[(base,ppm,"slope")]    = sv
+                self._entry_vars[(base,ppm,"delta_emf")] = ev_k
+                for v2,w2,lbl2 in [(sv,8,"mV/s"),(ev_k,7,"ΔmV")]:
+                    e=tk.Entry(row, textvariable=v2, width=w2,
+                               bg=DIM if is_u else BORDER,
+                               fg=GREEN if is_u else TEXT,
+                               insertbackground=TEXT, relief="flat",
+                               font=("Courier New",9))
+                    e.pack(side="left",padx=2,pady=3)
+                    tk.Label(row,text=lbl2,font=("Courier New",7),
+                             fg=MUTED,bg=SURFACE2,padx=2).pack(side="left")
+                tk.Label(row, text="★" if is_u else "·",
+                         font=("Courier New",8), fg=GREEN if is_u else MUTED,
+                         bg=SURFACE2, padx=3).pack(side="right")
+
+    def _apply_edits(self):
+        done=set()
+        for (base,ppm,feat), var in self._entry_vars.items():
+            key=(base,ppm)
+            if key not in done:
+                done.add(key)
+                sv = self._entry_vars.get((base,ppm,"slope"))
+                ev = self._entry_vars.get((base,ppm,"delta_emf"))
+                try:
+                    ns = float(sv.get()) if sv else 0.0
+                    ne = float(ev.get()) if ev else 0.0
+                    CAL_MGR.update_single_point(base, ppm, ns, ne)
+                except ValueError:
+                    messagebox.showerror("Invalid","Bad value."); return
+        CAL_MGR._autosave(); self.refresh()
+
+    def _restore_factory(self):
+        if not messagebox.askyesno("Restore factory","Reset all slopes to factory defaults?"): return
+        global CALIBRATION_CURVES
+        CALIBRATION_CURVES=copy.deepcopy(FACTORY_CURVES)
+        CAL_MGR._autosave(); self.refresh()
+
+    def refresh(self):
+        self._draw_slope_curves()
+        self._draw_2d_scatter()
+        self._rebuild_edit_table()
+
+    def _draw_slope_curves(self):
+        self._fig_slope.clear()
+        states=sorted(CALIBRATION_CURVES.keys()); n=len(states)
+        cols_n=3; rows_n=math.ceil(n/cols_n)
+        fit_type=self._fit_type.get()
+        fact_map={(b,p[2]):p[0] for b,c in FACTORY_CURVES.items() for p in c}
+        for idx,base in enumerate(states):
+            ax=self._fig_slope.add_subplot(rows_n,cols_n,idx+1)
+            ax.set_facecolor(SURFACE)
+            for sp in ax.spines.values(): sp.set_color(BORDER)
+            ax.tick_params(colors=MUTED, labelsize=6)
+            ax.set_title(f"Base: {GAS_NAMES.get(base,str(base))}",
+                         fontsize=7,color=MUTED,fontfamily="monospace")
+            ax.set_xlabel("ppm",fontsize=6,color=MUTED)
+            ax.set_ylabel("slope (mV/s)",fontsize=6,color=MUTED)
+            ax.grid(True,color=BORDER,lw=0.4,ls="--",alpha=0.5)
+            curve=CALIBRATION_CURVES[base]
+            slopes=[p[0] for p in curve if p[0]>0]
+            ppms  =[p[2] for p in curve if p[0]>0]
+            if not slopes: continue
+            for s,p in zip(slopes,ppms):
+                is_u=fact_map.get((base,p),None)!=s
+                ax.scatter(p,s,color=GREEN if is_u else MUTED,
+                           s=40,zorder=5,edgecolors=SURFACE,linewidths=1)
+                ax.annotate(PPM_LABELS.get(p,str(p)),xy=(p,s),xytext=(4,3),
+                            textcoords="offset points",fontsize=5,color=MUTED)
+            p_arr=np.array(ppms,dtype=float); s_arr=np.array(slopes,dtype=float)
+            xfit=np.linspace(p_arr.min(),p_arr.max()*1.05,200)
+            try:
+                if fit_type=="linear-interp":
+                    ax.plot(xfit,np.interp(xfit,p_arr,s_arr),color=ACCENT,lw=1.2)
+                elif fit_type=="power-law" and len(p_arr)>=2:
+                    c=np.polyfit(np.log10(np.clip(p_arr,1,None)),
+                                 np.log10(np.clip(s_arr,0.01,None)),1)
+                    ax.plot(xfit,10**c[1]*xfit**c[0],color=PURPLE,lw=1.2,
+                            label=f"b={c[0]:.2f}")
+                    ax.legend(facecolor=SURFACE,labelcolor=TEXT,fontsize=5)
+                elif fit_type=="michaelis-menten" and len(p_arr)>=2:
+                    def mm(x,Vm,Km): return Vm*x/(Km+x)
+                    popt,_=curve_fit(mm,p_arr,s_arr,
+                                     p0=[s_arr.max()*1.5,p_arr.mean()],
+                                     maxfev=5000,bounds=([0,0],[1e6,1e8]))
+                    ax.plot(xfit,mm(xfit,*popt),color=TEAL,lw=1.2,
+                            label=f"Vm={popt[0]:.0f}")
+                    ax.legend(facecolor=SURFACE,labelcolor=TEXT,fontsize=5)
+            except Exception: pass
+        self._fig_slope.set_facecolor(BG)
+        self._fig_slope.subplots_adjust(hspace=0.55,wspace=0.38,
+                                        left=0.08,right=0.97,top=0.94,bottom=0.08)
+        self._canvas_slope.draw_idle()
+
+    def _draw_2d_scatter(self):
+        self._fig_2d.clear()
+        ax=self._fig_2d.add_subplot(111)
+        ax.set_facecolor(SURFACE)
+        for sp in ax.spines.values(): sp.set_color(BORDER)
+        ax.tick_params(colors=MUTED,labelsize=8)
+        ax.set_title("2D Feature Space: slope vs Δ EMF  (each point = one transition)",
+                     fontsize=9,color=MUTED,fontfamily="monospace")
+        ax.set_xlabel("Δ EMF — 20-pt window (mV)",fontsize=8,color=MUTED)
+        ax.set_ylabel("Mean slope — 20-pt (mV/s)",fontsize=8,color=MUTED)
+        ax.grid(True,color=BORDER,lw=0.5,ls="--",alpha=0.5)
+
+        COLORS = [ACCENT,GREEN,TEAL,YELLOW,ORANGE,PURPLE,RED,CYAN]
+        fact_map={(b,p[2]):(p[0],p[1]) for b,c in FACTORY_CURVES.items() for p in c}
+
+        handles=[]
+        for bi,base in enumerate(sorted(CALIBRATION_CURVES.keys())):
+            col=COLORS[bi%len(COLORS)]
+            for slope,delta_emf,ppm in CALIBRATION_CURVES[base]:
+                if slope==0: continue
+                is_u=fact_map.get((base,ppm),(slope,delta_emf))[0]!=slope
+                ax.scatter(delta_emf,slope,
+                           color=col,s=60 if is_u else 35,
+                           marker='*' if is_u else 'o',
+                           zorder=5,edgecolors=SURFACE,linewidths=1)
+                ax.annotate(f"{PPM_LABELS.get(ppm,str(ppm))}",
+                            xy=(delta_emf,slope),xytext=(5,3),
+                            textcoords="offset points",fontsize=7,
+                            color=col,fontfamily="monospace")
+            import matplotlib.patches as mpatches
+            handles.append(mpatches.Patch(color=col,
+                label=GAS_NAMES.get(base,str(base))))
+
+        ax.legend(handles=handles,facecolor=SURFACE,labelcolor=TEXT,
+                  fontsize=7,loc="upper left")
+        ax.text(0.98,0.02,"★=user-measured  ●=factory",
+                transform=ax.transAxes,fontsize=7,color=MUTED,
+                ha="right",va="bottom",fontfamily="monospace")
+
+        self._fig_2d.set_facecolor(BG)
+        self._fig_2d.subplots_adjust(left=0.10,right=0.97,top=0.93,bottom=0.10)
+        self._canvas_2d.draw_idle()
+
+    def _export_png(self):
+        path=filedialog.asksaveasfilename(defaultextension=".png",filetypes=[("PNG","*.png")])
+        if not path: return
+        self._fig_slope.savefig(path,dpi=150,bbox_inches="tight",facecolor=BG)
+        messagebox.showinfo("Saved",f"PNG saved:\n{path}")
+    def _export_csv(self):
+        path=filedialog.asksaveasfilename(defaultextension=".csv",filetypes=[("CSV","*.csv")])
+        if not path: return
+        CAL_MGR.export_csv(path)
+        messagebox.showinfo("Saved",f"CSV saved:\n{path}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN APP  v11
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DetectorApp(tk.Tk):
+    HISTORY   = 2000
+    REDRAW_MS = 150
+
+    def __init__(self):
+        super().__init__()
+        self.title("Smart Probe — H₂  v11  |  Calibrate → Curves → Detect")
+        self.configure(bg=PANEL)
+        self.geometry("1800x1060"); self.minsize(1300,820)
+
+        self._det=Detector(); self._sim=Simulator()
+        self._tailer=None; self._ingest_job=None; self._redraw_job=None
+        self._mode="idle"; self._redraw_dirty=False
+        self._ht=collections.deque(maxlen=self.HISTORY)
+        self._hv=collections.deque(maxlen=self.HISTORY)
+        self._hd=collections.deque(maxlen=self.HISTORY)
+        self._hp=collections.deque(maxlen=self.HISTORY)
+        self._hbl=collections.deque(maxlen=self.HISTORY)
+        self._hst=collections.deque(maxlen=self.HISTORY)
+        self._tel=0.0
+        self._sim_v=np.array([]); self._sim_t=np.array([])
+        self._sim_lbl=[]; self._sim_idx=0; self._sim_spd=50
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _build_ui(self):
+        hdr=tk.Frame(self, bg=BG, pady=5); hdr.pack(fill="x")
+        tk.Label(hdr, text="H₂ Smart Probe  v11  |  Fixed Slope Capture  +  Δ EMF Dual-Feature",
+                 bg=BG, fg=TEXT, font=("Courier New",11,"bold")).pack(side="left", padx=14)
+        self._cal_badge=tk.Label(hdr, text="🔒  DETECT LOCKED",
+                                  bg=BG, fg=RED, font=("Courier New",9,"bold"), padx=12)
+        self._cal_badge.pack(side="right")
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
+
+        nb_s=ttk.Style(); nb_s.theme_use("clam")
+        nb_s.configure("TNotebook",background=BG,borderwidth=0)
+        nb_s.configure("TNotebook.Tab",background=PANEL,foreground=SUB,
+                       font=("Courier New",10,"bold"),padding=[18,8])
+        nb_s.map("TNotebook.Tab",background=[("selected",SURFACE)],
+                 foreground=[("selected",TEAL)])
+
+        self._nb=ttk.Notebook(self); self._nb.pack(fill="both",expand=True)
+
+        cal_f=tk.Frame(self._nb,bg=BG); self._nb.add(cal_f,text="🔬  Calibrate")
+        self._wizard=GuidedCalibrationWizard(cal_f,
+            on_complete=self._on_cal_complete,on_reset=self._on_cal_reset)
+        self._wizard.pack(fill="both",expand=True,padx=8,pady=8)
+
+        cur_f=tk.Frame(self._nb,bg=BG); self._nb.add(cur_f,text="📈  Curves")
+        self._curves_tab=CalibrationCurvesTab(cur_f)
+        self._curves_tab.pack(fill="both",expand=True)
+
+        det_f=tk.Frame(self._nb,bg=BG); self._nb.add(det_f,text="📡  Detect  🔒")
+        self._build_detect_tab(det_f)
+
+        self._status=tk.StringVar(value="Welcome! Complete calibration to unlock detection.")
+        tk.Label(self,textvariable=self._status,bg=BG,fg=SUB,
+                 font=("Courier New",8),anchor="w").pack(side="bottom",fill="x",padx=8,pady=2)
+
+        self._nb.select(0)
+        if not CAL_MGR.is_calibrated: self._nb.tab(2,state="disabled")
+        else: self._unlock_detect()
+
+    def _on_cal_complete(self):
+        self._unlock_detect(); self._curves_tab.refresh()
+        self._status.set("✅  Calibrated — Detect unlocked.  Check 📈 Curves.")
+    def _on_cal_reset(self):
+        self._nb.tab(2,state="disabled"); self._nb.tab(2,text="📡  Detect  🔒")
+        self._cal_badge.config(text="🔒  DETECT LOCKED",fg=RED); self._curves_tab.refresh()
+    def _unlock_detect(self):
+        self._nb.tab(2,state="normal"); self._nb.tab(2,text="📡  Detect  ✅")
+        self._cal_badge.config(text="✅  CALIBRATED — Detect unlocked",fg=GREEN)
+        self._det.reset(); self._det.set_initial_baseline(CAL_MGR.cal_baseline_mv)
+
+    # ── detect tab ────────────────────────────────────────────────────────────
+    def _build_detect_tab(self, parent):
+        tb=tk.Frame(parent,bg=PANEL,pady=4); tb.pack(fill="x",padx=8)
+        def btn(lbl,cmd,bg=ACCENT,fg=BG):
+            return tk.Button(tb,text=lbl,command=cmd,bg=bg,fg=fg,
+                             font=("Courier New",9,"bold"),relief="flat",
+                             cursor="hand2",padx=9,pady=4)
+        btn("📂  Live File",   self._start_live).pack(side="left",padx=2)
+        btn("⏹  Stop",        self._stop_all,  BORDER,TEXT).pack(side="left",padx=2)
+        btn("♻️  Reset",       self._do_reset,  BORDER,TEXT).pack(side="left",padx=2)
+        tk.Frame(tb,bg=BORDER,width=2,height=28).pack(side="left",padx=6)
+        btn("🧪  Simulator",   self._open_sim,  PURPLE,TEXT).pack(side="left",padx=2)
+        tk.Frame(tb,bg=BORDER,width=2,height=28).pack(side="left",padx=6)
+        tk.Label(tb,text="Baseline:",bg=PANEL,fg=SUB,font=("Courier New",8)).pack(side="left",padx=(6,2))
+        self._bl_var=tk.StringVar(value="Air (0 ppm)")
+        bl_cb=ttk.Combobox(tb,textvariable=self._bl_var,
+                           values=["Air (0 ppm)","100 ppm","1000 ppm","5000 ppm"],
+                           state="readonly",width=14,font=("Courier New",8))
+        bl_cb.pack(side="left"); bl_cb.bind("<<ComboboxSelected>>",self._on_baseline_change)
+        tk.Frame(tb,bg=BORDER,width=2,height=28).pack(side="left",padx=6)
+        btn("💾  CSV",  self._export_csv, YELLOW,BG).pack(side="left",padx=2)
+        btn("🖼  PNG",  self._save_png,   CYAN,  BG).pack(side="left",padx=2)
+        tk.Frame(tb,bg=BORDER,width=2,height=28).pack(side="left",padx=6)
+        btn("🔬  Re-Cal",lambda:self._nb.select(0),TEAL,"#0a0c0f").pack(side="left",padx=2)
+        btn("📈  Curves",lambda:self._nb.select(1),ACCENT,BG).pack(side="left",padx=2)
+
+        body=tk.Frame(parent,bg=BG); body.pack(fill="both",expand=True,padx=8,pady=4)
+        left=tk.Frame(body,bg=PANEL,width=320)
+        left.pack(side="left",fill="y",padx=(0,4)); left.pack_propagate(False)
+        self._build_readout(left)
+        right=tk.Frame(body,bg=BG); right.pack(side="left",fill="both",expand=True)
+        self._build_plots(right)
+
+    def _on_baseline_change(self,_=None):
+        m={"Air (0 ppm)":0,"100 ppm":100,"1000 ppm":1000,"5000 ppm":5000}
+        ppm=m.get(self._bl_var.get(),0)
+        self._det.set_baseline_ppm(ppm); self._det.cur_ppm=get_base_state(ppm)
+
+    def _build_readout(self, p):
+        tk.Label(p,text="H₂ Detector  v11",bg=PANEL,fg=ACCENT,
+                 font=("Courier New",10,"bold")).pack(pady=(10,2))
+        self._ppm_str=tk.StringVar(value="0")
+        self._ppm_lbl=tk.Label(p,textvariable=self._ppm_str,bg=PANEL,fg=GREEN,
+                                font=("Courier New",40,"bold"))
+        self._ppm_lbl.pack(pady=1)
+        tk.Label(p,text="ppm  H₂",bg=PANEL,fg=SUB,font=("Courier New",8)).pack()
+        self._label_str=tk.StringVar(value="Air / ambient")
+        tk.Label(p,textvariable=self._label_str,bg=PANEL,fg=TEXT,
+                 font=("Courier New",9,"bold")).pack(pady=2)
+
+        rr=tk.Frame(p,bg=PANEL); rr.pack()
+        tk.Label(rr,text="Regime:",bg=PANEL,fg=SUB,font=("Courier New",8)).pack(side="left",padx=(0,4))
+        self._regime_str=tk.StringVar(value="—")
+        self._regime_lbl=tk.Label(rr,textvariable=self._regime_str,bg=BORDER,fg=SUB,
+                                   font=("Courier New",9,"bold"),padx=8,pady=2)
+        self._regime_lbl.pack(side="left")
+
+        self._band_str=tk.StringVar(value="")
+        tk.Label(p,textvariable=self._band_str,bg=PANEL,fg=CYAN,font=("Courier New",7)).pack()
+
+        self._state_str=tk.StringVar(value="WARMUP")
+        self._state_lbl=tk.Label(p,textvariable=self._state_str,bg=ACCENT,fg=BG,
+                                  font=("Courier New",10,"bold"),padx=14,pady=3)
+        self._state_lbl.pack(pady=3)
+
+        # Phase indicator
+        self._phase_str=tk.StringVar(value="")
+        tk.Label(p,textvariable=self._phase_str,bg=PANEL,fg=YELLOW,
+                 font=("Courier New",8)).pack()
+
+        timer_cv=tk.Canvas(p,bg=BORDER,height=10,width=260,highlightthickness=0)
+        timer_cv.pack(pady=2)
+        self._timer_bar=timer_cv.create_rectangle(0,0,0,10,fill=YELLOW,outline="")
+        self._timer_cv=timer_cv
+
+        tk.Frame(p,bg=BORDER,height=1).pack(fill="x",padx=8,pady=4)
+        tk.Label(p,text="DUAL-FEATURE DIAGNOSTICS",bg=PANEL,fg=YELLOW,
+                 font=("Courier New",8,"bold")).pack()
+        self._mvar={}
+        for k,col in [("V (mV)",TEXT),("Baseline",TEXT),("Locked BL",TEXT),
+                      ("Phase",YELLOW),("Meas.Count",YELLOW),
+                      ("Slope (mean)",TEAL),("Δ EMF (mV)",ACCENT),
+                      ("Discrete Hit",GREEN),("Smooth ppm",CYAN),
+                      ("Match Score",ORANGE),("Match Method",GREEN),
+                      ("Elapsed (s)",TEXT)]:
+            row=tk.Frame(p,bg=PANEL); row.pack(fill="x",padx=10,pady=1)
+            tk.Label(row,text=k,bg=PANEL,fg=SUB,font=("Courier New",7),
+                     anchor="w",width=16).pack(side="left")
+            var=tk.StringVar(value="—")
+            tk.Label(row,textvariable=var,bg=PANEL,fg=col,
+                     font=("Courier New",8),anchor="e").pack(side="right")
+            self._mvar[k]=var
+
+    def _build_plots(self, parent):
+        pf=tk.Frame(parent,bg=BG); pf.pack(fill="both",expand=True)
+        self.fig=plt.figure(figsize=(11,7)); self.fig.patch.set_facecolor(BG)
+        gs=gridspec.GridSpec(4,1,figure=self.fig,hspace=0.50,
+                             left=0.07,right=0.97,top=0.94,bottom=0.05,
+                             height_ratios=[2.2,1.2,1.2,2.0])
+        self.ax_v  =self.fig.add_subplot(gs[0])
+        self.ax_d  =self.fig.add_subplot(gs[1])
+        self.ax_r  =self.fig.add_subplot(gs[2])
+        self.ax_ppm=self.fig.add_subplot(gs[3])
+        for ax in (self.ax_v,self.ax_d,self.ax_r,self.ax_ppm): self._sax(ax)
+        self.ax_v.set_title("EMF (mV)  — orange=baseline",color=TEXT,fontsize=8)
+        self.ax_d.set_title("dV/dt (mV/s)  — DELAY then COLLECT 20",color=TEXT,fontsize=8)
+        self.ax_r.set_title("Slope (mV/s)  HIGH≥40 / MED≥10 / LOW<10",color=TEXT,fontsize=8)
+        self.ax_ppm.set_title("H₂ (ppm) — Dual-feature 2D Hybrid",color=TEXT,fontsize=8)
+        for ax,u in [(self.ax_v,"mV"),(self.ax_d,"mV/s"),(self.ax_r,"mV/s"),(self.ax_ppm,"ppm")]:
+            ax.set_ylabel(u,color=TEXT,fontsize=7)
+        self.ax_ppm.set_xlabel("Elapsed (s)",color=TEXT,fontsize=7)
+        self._ln_v,  =self.ax_v.plot([],[],  color=ACCENT,lw=0.9,label="V")
+        self._ln_bl, =self.ax_v.plot([],[],  color=ORANGE,lw=0.9,ls="--",alpha=0.7,label="Baseline")
+        self._ln_d,  =self.ax_d.plot([],[],  color=YELLOW,lw=0.9)
+        self._ln_r,  =self.ax_r.plot([],[],  color=ACCENT,lw=1.0)
+        self._ln_ppm,=self.ax_ppm.plot([],[],color=RED,   lw=1.6,label="2D ppm")
+        thresh=ONSET_THRESH/DT; slow=SLOW_THRESH/DT
+        self.ax_d.axhline( thresh,color=GREEN, lw=0.7,ls="--",alpha=0.7,label=f"fast>{thresh:.0f}")
+        self.ax_d.axhline( slow,  color=YELLOW,lw=0.7,ls=":", alpha=0.7,label=f"slow>{slow:.0f}")
+        self.ax_d.axhline(-thresh,color=RED,   lw=0.7,ls="--",alpha=0.7)
+        self.ax_d.axhline(0,color=BORDER,lw=0.7,ls="--")
+        self.ax_r.axhline(40,color=GREEN, lw=0.7,ls="--",alpha=0.5)
+        self.ax_r.axhline(10,color=YELLOW,lw=0.7,ls="--",alpha=0.5)
+        for pr,lr in [(100,"100"),(1000,"1k"),(10000,"1%")]:
+            self.ax_ppm.axhline(pr,color=SUB,lw=0.5,ls=":",alpha=0.5)
+            self.ax_ppm.text(0.5,pr*1.03,lr,color=SUB,fontsize=6,
+                             va="bottom",transform=self.ax_ppm.get_yaxis_transform())
+        self.ax_v.legend(facecolor=PANEL,labelcolor=TEXT,fontsize=7,loc="upper left")
+        self.ax_d.legend(facecolor=PANEL,labelcolor=TEXT,fontsize=6,loc="upper right")
+        self.ax_ppm.legend(facecolor=PANEL,labelcolor=TEXT,fontsize=7,loc="upper left")
+        self.canvas=FigureCanvasTkAgg(self.fig,master=pf)
+        self.canvas.get_tk_widget().pack(fill="both",expand=True)
+        tbf=tk.Frame(pf,bg=BORDER); tbf.pack(fill="x")
+        nav=NavigationToolbar2Tk(self.canvas,tbf); nav.config(bg=BORDER)
+        for c in nav.winfo_children():
+            try: c.config(bg=BORDER,fg=TEXT)
+            except: pass
+        nav.update(); self.canvas.draw()
+        tbl=tk.Frame(parent,bg=PANEL,height=120)
+        tbl.pack(fill="x",pady=(4,0)); tbl.pack_propagate(False)
+        tk.Label(tbl,text="Detection Events",bg=PANEL,fg=ACCENT,
+                 font=("Courier New",8,"bold")).pack(anchor="w",padx=8,pady=2)
+        cols=("Time","Event","ppm","Base","Slope","ΔEmf","Match","Score","Note")
+        self._tree=ttk.Treeview(tbl,columns=cols,show="headings",height=4)
+        style2=ttk.Style()
+        style2.configure("Treeview",background=BG,fieldbackground=BG,
+                          foreground=TEXT,font=("Courier New",7))
+        style2.configure("Treeview.Heading",background=BORDER,foreground=ACCENT,
+                          font=("Courier New",7,"bold"))
+        style2.map("Treeview",background=[("selected",BORDER)])
+        widths={"Time":50,"Event":110,"ppm":80,"Base":65,"Slope":80,
+                "ΔEmf":70,"Match":60,"Score":55,"Note":260}
+        for col in cols:
+            self._tree.heading(col,text=col)
+            self._tree.column(col,width=widths.get(col,80),anchor="center")
+        vsb=ttk.Scrollbar(tbl,orient="vertical",command=self._tree.yview)
+        self._tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right",fill="y"); self._tree.pack(fill="both",expand=True,padx=4)
+
+    # ── simulator dialog ──────────────────────────────────────────────────────
+    def _open_sim(self):
+        w=tk.Toplevel(self); w.title("Simulator"); w.configure(bg=PANEL)
+        w.geometry("720x540"); w.grab_set()
+        tk.Label(w,text="Gas Exposure Scenario Builder",bg=PANEL,fg=TEXT,
+                 font=("Courier New",11,"bold"),pady=8).pack()
+        PRESETS={
+            "Multi-conc":[(0,60),(100,90),(0,90),(1000,90),(0,90),(10000,90),(0,90),(20000,90),(0,90)],
+            "3×1000ppm": [(0,60),(1000,120),(0,90),(1000,120),(0,90),(1000,120),(0,90)],
+            "100→1000":  [(0,60),(100,120),(0,60),(1000,120),(0,90)],
+        }
+        step_rows=[]
+        pf=tk.Frame(w,bg=PANEL); pf.pack(pady=4)
+        tk.Label(pf,text="Preset:",bg=PANEL,fg=SUB,font=("Courier New",8)).pack(side="left",padx=4)
+        sf=tk.Frame(w,bg=BG); sf.pack(fill="both",expand=True,padx=10,pady=4)
+        cv=tk.Canvas(sf,bg=BG,highlightthickness=0)
+        sb2=ttk.Scrollbar(sf,orient="vertical",command=cv.yview)
+        inner=tk.Frame(cv,bg=BG)
+        inner.bind("<Configure>",lambda e:cv.configure(scrollregion=cv.bbox("all")))
+        cv.create_window((0,0),window=inner,anchor="nw")
+        cv.configure(yscrollcommand=sb2.set)
+        sb2.pack(side="right",fill="y"); cv.pack(fill="both",expand=True)
+        def draw_hdr():
+            for c,(t,wd) in enumerate([("Step",5),("ppm",20),("Dur(s)",12),("",4)]):
+                tk.Label(inner,text=t,bg=BORDER,fg=ACCENT,
+                         font=("Courier New",8,"bold"),width=wd,pady=3
+                         ).grid(row=0,column=c,sticky="ew",padx=1,pady=1)
+        def add_row(ppm=0,dur=60):
+            ri=len(step_rows)+1
+            tk.Label(inner,text=str(ri),bg=BG,fg=SUB,
+                     font=("Courier New",8),width=5).grid(row=ri,column=0,padx=1,pady=1)
+            pv=tk.StringVar(value=str(ppm)); dv=tk.StringVar(value=str(dur))
+            ttk.Combobox(inner,textvariable=pv,
+                         values=["0","100","1000","5000","10000","20000"],
+                         width=18,font=("Courier New",9)).grid(row=ri,column=1,padx=1,pady=1)
+            tk.Entry(inner,textvariable=dv,width=12,bg=BORDER,fg=TEXT,
+                     insertbackground=TEXT,relief="flat",
+                     font=("Courier New",9)).grid(row=ri,column=2,padx=1,pady=1)
+            def rm(pv_=pv):
+                idx2=next((i for i,(p,d) in enumerate(step_rows) if p is pv_),None)
+                if idx2 is not None: step_rows.pop(idx2)
+                for ww in inner.winfo_children(): ww.destroy()
+                draw_hdr()
+                for p,d in step_rows: add_row(p.get(),d.get())
+            tk.Button(inner,text="✕",command=rm,bg=RED,fg=BG,
+                      font=("Courier New",8),relief="flat",padx=4
+                      ).grid(row=ri,column=3,padx=1)
+            step_rows.append((pv,dv))
+        def apply_preset(steps):
+            for ww in inner.winfo_children(): ww.destroy()
+            step_rows.clear(); draw_hdr()
+            for ppm,dur in steps: add_row(ppm,dur)
+        for name,steps in PRESETS.items():
+            tk.Button(pf,text=name,command=lambda s=steps:apply_preset(s),
+                      bg=BORDER,fg=TEXT,font=("Courier New",8),
+                      relief="flat",padx=5,pady=2).pack(side="left",padx=2)
+        draw_hdr()
+        for ppm,dur in PRESETS["Multi-conc"]: add_row(ppm,dur)
+        cfg=tk.Frame(w,bg=PANEL); cfg.pack(pady=4)
+        def ent(val,wd=8):
+            v=tk.StringVar(value=val)
+            tk.Entry(cfg,textvariable=v,width=wd,bg=BORDER,fg=TEXT,
+                     insertbackground=TEXT,relief="flat",font=("Courier New",9)).pack(side="left")
+            return v
+        for lbl in ["Baseline (mV):","Noise σ:","Speed ms/s:"]:
+            tk.Label(cfg,text=lbl,bg=PANEL,fg=SUB,font=("Courier New",8)).pack(side="left",padx=(8,2))
+        bl_v=ent("28.0"); ns_v=ent("0.08"); sp_v=ent("50",6)
+        bf=tk.Frame(w,bg=PANEL); bf.pack(pady=6)
+        tk.Button(bf,text="➕ Add",bg=ACCENT,fg=BG,font=("Courier New",9,"bold"),
+                  relief="flat",cursor="hand2",padx=10,pady=4,
+                  command=lambda:add_row()).pack(side="left",padx=4)
+        def run_sim():
+            steps=[]
+            for pv,dv in step_rows:
+                try: steps.append((float(pv.get()),float(dv.get())))
+                except: pass
+            if not steps: messagebox.showwarning("Empty","Add steps.",parent=w); return
+            try: bl=float(bl_v.get())
+            except: bl=28.0
+            try: ns=float(ns_v.get())
+            except: ns=0.08
+            try: sp=max(10,int(sp_v.get()))
+            except: sp=50
+            t_arr,v_arr,lbl_arr=self._sim.generate(steps,bl,ns)
+            w.destroy(); self._launch_sim(t_arr,v_arr,lbl_arr,sp)
+        tk.Button(bf,text="▶ Run",bg=GREEN,fg=BG,
+                  font=("Courier New",10,"bold"),relief="flat",cursor="hand2",
+                  padx=14,pady=5,command=run_sim).pack(side="left",padx=4)
+        tk.Button(bf,text="Cancel",bg=BORDER,fg=TEXT,font=("Courier New",9),
+                  relief="flat",cursor="hand2",padx=10,pady=5,
+                  command=w.destroy).pack(side="left",padx=2)
+
+    # ── live / sim ────────────────────────────────────────────────────────────
+    def _start_live(self):
+        path=filedialog.askopenfilename(title="Open log",
+            filetypes=[("Log","*.log *.txt"),("All","*.*")])
+        if not path: return
+        self._stop_all(); self._det.reset()
+        self._det.set_initial_baseline(CAL_MGR.cal_baseline_mv); self._clear_hist()
+        self._tailer=LogTailer(path); self._tailer.start()
+        self._mode="live"; self._status.set(f"Live: {os.path.basename(path)}")
+        self._start_scheduled_redraw(); self._tick_live()
+
+    def _tick_live(self):
+        if self._mode!="live": return
+        for v in self._tailer.get_new(): self._ingest(v)
+        self._ingest_job=self.after(80,self._tick_live)
+
+    def _launch_sim(self,t_arr,v_arr,lbl_arr,spd):
+        self._stop_all(); self._det.reset()
+        self._det.set_initial_baseline(CAL_MGR.cal_baseline_mv); self._clear_hist()
+        self._sim_t=t_arr; self._sim_v=v_arr
+        self._sim_lbl=lbl_arr; self._sim_idx=0; self._sim_spd=spd
+        self._mode="simulate"
+        self._status.set(f"Simulating {len(t_arr)} samples ({t_arr[-1]:.0f}s)")
+        self._nb.select(2); self._start_scheduled_redraw(); self._tick_sim()
+
+    def _tick_sim(self):
+        if self._mode!="simulate": return
+        if self._sim_idx>=len(self._sim_v): self._status.set("Simulation complete."); return
+        self._ingest(self._sim_v[self._sim_idx]); self._sim_idx+=1
+        self._ingest_job=self.after(self._sim_spd,self._tick_sim)
+
+    # ── ingest ────────────────────────────────────────────────────────────────
+    def _ingest(self, v_mv):
+        res=self._det.push(v_mv); self._tel+=DT
+        self._ht.append(self._tel); self._hv.append(v_mv)
+        self._hd.append(res["diff_mvs"]); self._hp.append(res["ppm"])
+        self._hbl.append(res["baseline"]); self._hst.append(res["state"])
+        self._redraw_dirty=True
+
+        st=res["state"]; ppm=res["ppm"]
+        col=ppm_color(ppm) if st in ("GAS_ON","FALLING") else GREEN
+        self._ppm_str.set(f"{ppm:.0f}"); self._ppm_lbl.config(fg=col)
+        self._label_str.set(res["label"])
+        band=""
+        if ppm>10 and st=="GAS_ON":
+            band="✓ SNAP+ΔΕ" if res["in_band"] else "↗ INTERP"
+        self._band_str.set(band)
+        self._state_str.set(st); self._state_lbl.config(bg=STATE_COL.get(st,GREEN))
+        self._regime_str.set(res["regime"]); self._regime_lbl.config(fg=res["regime_col"])
+
+        # Phase display
+        dc=res["delay_count"]; mc=res["meas_count"]
+        if st=="MEASURING":
+            if dc < TRIG_WIN:
+                self._phase_str.set(f"⏱ DELAY  {dc}/{TRIG_WIN}")
+            else:
+                self._phase_str.set(f"🔴 COLLECT  {mc}/{SLOPE_WIN}")
+        else:
+            self._phase_str.set("")
+
+        frac=min(1.0, mc/SLOPE_WIN)
+        self._timer_cv.coords(self._timer_bar,0,0,int(260*frac),10)
+        self._timer_cv.itemconfig(self._timer_bar,
+            fill=YELLOW if st=="MEASURING" else BORDER)
+
+        slope=res["slope_frozen"]; de=res["delta_emf"]
+        disc,_,_=dual_feature_match(self._det.cur_ppm, slope, de)
+        smooth=piecewise_interp_2D(self._det.cur_ppm, slope)
+
+        self._mvar["V (mV)"].set(f"{v_mv:+.2f}")
+        self._mvar["Baseline"].set(f"{res['baseline']:.2f}")
+        self._mvar["Locked BL"].set(f"{res['locked_bl']:.2f}")
+        self._mvar["Phase"].set("DELAY" if (st=="MEASURING" and dc<TRIG_WIN) else
+                                ("COLLECT" if st=="MEASURING" else st))
+        self._mvar["Meas.Count"].set(f"{mc}/{SLOPE_WIN}")
+        self._mvar["Slope (mean)"].set(f"{slope:.3f}")
+        self._mvar["Δ EMF (mV)"].set(f"{de:.2f}")
+        self._mvar["Discrete Hit"].set(f"{disc} ppm" if disc else "none")
+        self._mvar["Smooth ppm"].set(f"{smooth:.1f}")
+        self._mvar["Match Score"].set(f"{res['match_score']:.3f}" if res['match_score']<999 else "—")
+        self._mvar["Match Method"].set(res["match_method"])
+        self._mvar["Elapsed (s)"].set(f"{self._tel:.1f}")
+
+        ev=res.get("event")
+        if ev and ev["kind"]=="GAS_DETECTED":
+            self._tree.insert("","0",values=(
+                f"{self._tel:.1f}",ev["kind"],f"{ppm:.0f}",
+                str(self._det.cur_ppm),f"{slope:.2f}",
+                f"{de:.1f}",
+                "SNAP" if res["in_band"] else "INTERP",
+                f"{res['match_score']:.2f}" if res['match_score']<999 else "—",
+                ev["note"]))
+
+    def _start_scheduled_redraw(self):
+        if self._redraw_job: self.after_cancel(self._redraw_job)
+        self._redraw_job=self.after(self.REDRAW_MS, self._redraw_tick)
+
+    def _redraw_tick(self):
+        if self._redraw_dirty:
+            self._redraw_dirty=False; self._redraw()
+        if self._mode!="idle":
+            self._redraw_job=self.after(self.REDRAW_MS, self._redraw_tick)
+
+    def _redraw(self):
+        if not self._ht: return
+        t=list(self._ht); v=list(self._hv); d=list(self._hd)
+        pp=list(self._hp); bl=list(self._hbl)
+        self._ln_v.set_data(t,v); self._ln_bl.set_data(t,bl)
+        self._ln_d.set_data(t,d); self._ln_ppm.set_data(t,pp); self._ln_r.set_data(t,d)
+        for ax,vals in [(self.ax_v,v),(self.ax_ppm,pp)]:
+            ax.set_xlim(t[0],max(t[-1],t[0]+5))
+            rng=max(vals)-min(vals); pad=max(rng*0.12,1.0)
+            ax.set_ylim(min(vals)-pad,max(vals)+pad)
+        for ax,vals in [(self.ax_d,d),(self.ax_r,d)]:
+            ax.set_xlim(t[0],max(t[-1],t[0]+5))
+            dm=max(abs(x) for x in vals) if vals else 2.0
+            ax.set_ylim(-max(dm*1.3,3.0),max(dm*1.3,3.0))
+        self.canvas.draw_idle()
+
+    def _stop_all(self):
+        if self._ingest_job: self.after_cancel(self._ingest_job); self._ingest_job=None
+        if self._redraw_job: self.after_cancel(self._redraw_job); self._redraw_job=None
+        if self._tailer:     self._tailer.stop(); self._tailer=None
+        self._mode="idle"
+
+    def _do_reset(self):
+        self._stop_all(); self._det.reset()
+        self._det.set_initial_baseline(CAL_MGR.cal_baseline_mv); self._clear_hist()
+        self._ppm_str.set("0"); self._ppm_lbl.config(fg=GREEN)
+        self._label_str.set("Air / ambient"); self._band_str.set("")
+        self._state_str.set("WARMUP"); self._state_lbl.config(bg=ACCENT)
+        self._regime_str.set("—"); self._regime_lbl.config(fg=SUB)
+        self._phase_str.set("")
+        self._timer_cv.coords(self._timer_bar,0,0,0,10)
+        for v in self._mvar.values(): v.set("—")
+        for row in self._tree.get_children(): self._tree.delete(row)
+        self._status.set("Reset.")
+
+    def _clear_hist(self):
+        for buf in (self._ht,self._hv,self._hd,self._hp,self._hbl,self._hst):
+            buf.clear()
+        self._tel=0.0
+        for ax in (self.ax_v,self.ax_d,self.ax_r,self.ax_ppm): ax.cla(); self._sax(ax)
+        thresh=ONSET_THRESH/DT; slow=SLOW_THRESH/DT
+        self.ax_d.axhline( thresh,color=GREEN, lw=0.7,ls="--",alpha=0.7)
+        self.ax_d.axhline( slow,  color=YELLOW,lw=0.7,ls=":", alpha=0.7)
+        self.ax_d.axhline(-thresh,color=RED,   lw=0.7,ls="--",alpha=0.7)
+        self.ax_d.axhline(0,color=BORDER,lw=0.7,ls="--")
+        self.ax_r.axhline(40,color=GREEN, lw=0.7,ls="--",alpha=0.5)
+        self.ax_r.axhline(10,color=YELLOW,lw=0.7,ls="--",alpha=0.5)
+        for pr,lr in [(100,"100"),(1000,"1k"),(10000,"1%")]:
+            self.ax_ppm.axhline(pr,color=SUB,lw=0.5,ls=":",alpha=0.5)
+            self.ax_ppm.text(0.5,pr*1.03,lr,color=SUB,fontsize=6,
+                             va="bottom",transform=self.ax_ppm.get_yaxis_transform())
+        self._ln_v,  =self.ax_v.plot([],[],  color=ACCENT,lw=0.9,label="V")
+        self._ln_bl, =self.ax_v.plot([],[],  color=ORANGE,lw=0.9,ls="--",alpha=0.7,label="BL")
+        self._ln_d,  =self.ax_d.plot([],[],  color=YELLOW,lw=0.9)
+        self._ln_r,  =self.ax_r.plot([],[],  color=ACCENT,lw=1.0)
+        self._ln_ppm,=self.ax_ppm.plot([],[],color=RED,   lw=1.6,label="2D ppm")
+        self.ax_v.legend(facecolor=PANEL,labelcolor=TEXT,fontsize=7,loc="upper left")
+        self.canvas.draw()
+
+    def _sax(self,ax):
+        ax.set_facecolor(BG)
+        for sp in ax.spines.values(): sp.set_edgecolor(BORDER)
+        ax.tick_params(colors=TEXT,labelsize=7)
+        ax.xaxis.label.set_color(TEXT); ax.yaxis.label.set_color(TEXT); ax.title.set_color(TEXT)
+        ax.grid(True,color=PANEL,lw=0.5,ls="--",alpha=0.8)
+
+    def _export_csv(self):
+        if not self._ht: messagebox.showinfo("No data","Run first."); return
+        path=filedialog.asksaveasfilename(defaultextension=".csv",filetypes=[("CSV","*.csv")])
+        if not path: return
+        with open(path,"w",newline="") as f:
+            w=csv.writer(f)
+            w.writerow(["t_s","v_mv","dvdt_mVs","ppm","baseline_mv","state"])
+            for t,v,d,p,b,s in zip(self._ht,self._hv,self._hd,self._hp,self._hbl,self._hst):
+                w.writerow([f"{t:.4f}",f"{v:.4f}",f"{d:.4f}",f"{p:.1f}",f"{b:.4f}",s])
+        self._status.set(f"Exported → {os.path.basename(path)}")
+
+    def _save_png(self):
+        path=filedialog.asksaveasfilename(defaultextension=".png",filetypes=[("PNG","*.png")])
+        if not path: return
+        self.fig.savefig(path,dpi=150,bbox_inches="tight",facecolor=BG)
+        self._status.set(f"Saved → {os.path.basename(path)}")
+
+    def _on_close(self):
+        self._wizard.on_destroy(); self._stop_all(); plt.close("all"); self.destroy()
+
+
+if __name__ == "__main__":
+    app = DetectorApp()
+    if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
+        app.after(400, app._start_live)
+    app.mainloop()
